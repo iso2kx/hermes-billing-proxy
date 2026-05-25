@@ -973,6 +973,288 @@ function reverseMap(text, config) {
   return r;
 }
 
+// ─── SSE Streaming Helpers ──────────────────────────────────────────────────
+// Per-event reverseMap misses patterns that the upstream tokenizer split
+// across delta boundaries (e.g. "Cla" + "ude" never reverse-maps to
+// "Hermes"). These helpers let the streaming text_delta path apply reverseMap
+// across deltas without parsing the JSON body — preserving the proxy-wide
+// "no JSON.parse on bodies" principle the rest of the codebase honors.
+
+// Find the byte index of the first character of the string value for a
+// top-level JSON field named `key` in `json` (i.e. the index AFTER the
+// opening quote of the value). Skips over earlier string values so a fake
+// `"key":` embedded inside another value can't false-match. Returns -1 if
+// the key isn't present at the top level as a string field.
+function findSseStringField(json, key) {
+  const needle = '"' + key + '":';
+  let i = 0;
+  let inString = false;
+  while (i < json.length) {
+    const ch = json.charCodeAt(i);
+    if (inString) {
+      if (ch === 0x5c) { i += 2; continue; }
+      if (ch === 0x22) { inString = false; i++; continue; }
+      i++; continue;
+    }
+    if (ch === 0x22) {
+      if (json.startsWith(needle, i)) {
+        let j = i + needle.length;
+        while (j < json.length && (json.charCodeAt(j) === 0x20 || json.charCodeAt(j) === 0x09)) j++;
+        if (json.charCodeAt(j) === 0x22) return j + 1;
+        return -1;
+      }
+      inString = true;
+      i++;
+      continue;
+    }
+    i++;
+  }
+  return -1;
+}
+
+// Decode a JSON string literal starting at index `i` in `s` (i points to the
+// first byte AFTER the opening quote). Returns { value, end } where `end`
+// is the byte index AFTER the closing quote. Supports \uXXXX (incl. astral
+// surrogate pairs) and all standard backslash escapes.
+function jsonStringDecode(s, i) {
+  let out = '';
+  while (i < s.length) {
+    const ch = s.charCodeAt(i);
+    if (ch === 0x22) return { value: out, end: i + 1 };
+    if (ch === 0x5c) {
+      const next = s.charCodeAt(i + 1);
+      if (next === 0x75) {
+        const code = parseInt(s.slice(i + 2, i + 6), 16);
+        if (code >= 0xD800 && code <= 0xDBFF &&
+            s.charCodeAt(i + 6) === 0x5c && s.charCodeAt(i + 7) === 0x75) {
+          const low = parseInt(s.slice(i + 8, i + 12), 16);
+          out += String.fromCharCode(code, low);
+          i += 12;
+        } else {
+          out += String.fromCharCode(code);
+          i += 6;
+        }
+        continue;
+      }
+      switch (next) {
+        case 0x22: out += '"'; break;
+        case 0x5c: out += '\\'; break;
+        case 0x2f: out += '/'; break;
+        case 0x6e: out += '\n'; break;
+        case 0x74: out += '\t'; break;
+        case 0x72: out += '\r'; break;
+        case 0x62: out += '\b'; break;
+        case 0x66: out += '\f'; break;
+        default: out += String.fromCharCode(next);
+      }
+      i += 2;
+      continue;
+    }
+    out += s[i];
+    i++;
+  }
+  // Unterminated string — return what we have; caller treats this as failure
+  // (end > s.length signals "didn't find closing quote").
+  return { value: out, end: s.length + 1 };
+}
+
+// Encode `s` as the body of a JSON string literal (no surrounding quotes).
+// Matches JSON.stringify output for control chars / quote / backslash; lets
+// non-ASCII pass through unescaped (same as JSON.stringify's default).
+function jsonStringEncode(s) {
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s.charCodeAt(i);
+    switch (ch) {
+      case 0x22: out += '\\"'; break;
+      case 0x5c: out += '\\\\'; break;
+      case 0x08: out += '\\b'; break;
+      case 0x09: out += '\\t'; break;
+      case 0x0a: out += '\\n'; break;
+      case 0x0c: out += '\\f'; break;
+      case 0x0d: out += '\\r'; break;
+      default:
+        if (ch < 0x20) out += '\\u' + ch.toString(16).padStart(4, '0');
+        else out += s[i];
+    }
+  }
+  return out;
+}
+
+// Largest index in `buf` such that no COMPLETE occurrence of any pattern in
+// `patterns` straddles it. Used to decide how much of the per-block text
+// buffer is safe to reverseMap-and-emit now, vs. how much must be held back
+// to allow a pattern that may still be growing across future deltas to
+// complete in-buffer.
+function safeCut(buf, maxPatternLen, patterns) {
+  let cut = Math.max(0, buf.length - (maxPatternLen - 1));
+  let changed = true;
+  while (changed && cut > 0) {
+    changed = false;
+    for (const [pat] of patterns) {
+      if (!pat || pat.length === 0 || pat.length > buf.length) continue;
+      let i = buf.indexOf(pat);
+      while (i !== -1 && i < cut) {
+        if (i + pat.length > cut) {
+          cut = i;
+          changed = true;
+          break;
+        }
+        i = buf.indexOf(pat, i + 1);
+      }
+    }
+  }
+  return cut;
+}
+
+// Stateful SSE event transformer. Three handling modes by content block type:
+//   - thinking / redacted_thinking: byte-identical pass-through
+//   - tool_use: buffer all input_json_delta events for the block, extract
+//     each delta's partial_json string value, concat, reverseMap once, emit
+//     a single synthesized delta at content_block_stop (existing v2.2.x
+//     behavior — handles cross-delta splits in tool args)
+//   - text (default): maintain a per-block raw-text buffer; per delta, decode
+//     the text field, append, compute safeCut, reverseMap-and-emit only the
+//     safe prefix as a synthesized text_delta, hold the trailing bytes that
+//     could still grow into a pattern. Flush the held tail as one more
+//     synthesized text_delta at content_block_stop (or stream end via
+//     flushAll() if the stream truncates mid-block).
+function createSseEventTransformer(config) {
+  let maxReversePatternLen = 1;
+  for (const [s] of config.reverseMap) {
+    if (s && s.length > maxReversePatternLen) maxReversePatternLen = s.length;
+  }
+
+  let currentBlockIsThinking = false;
+  let toolUseBuffer = null;
+  const textBuffers = new Map();
+
+  const buildTextDelta = (index, text) =>
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":' +
+    index + ',"delta":{"type":"text_delta","text":"' + jsonStringEncode(text) +
+    '"}}\n\n';
+
+  const transform = (event) => {
+    let dataIdx = event.startsWith('data: ') ? 0 : event.indexOf('\ndata: ');
+    if (dataIdx === -1) return reverseMap(event, config);
+    if (dataIdx > 0) dataIdx += 1;
+    const dataLineEnd = event.indexOf('\n', dataIdx + 6);
+    const dataStr = dataLineEnd === -1
+      ? event.slice(dataIdx + 6)
+      : event.slice(dataIdx + 6, dataLineEnd);
+
+    const idxMatch = dataStr.match(/"index":(\d+)/);
+    const evtIndex = idxMatch ? parseInt(idxMatch[1], 10) : null;
+
+    if (dataStr.indexOf('"type":"content_block_start"') !== -1) {
+      if (dataStr.indexOf('"content_block":{"type":"thinking"') !== -1 ||
+          dataStr.indexOf('"content_block":{"type":"redacted_thinking"') !== -1) {
+        currentBlockIsThinking = true;
+        return event;
+      }
+      currentBlockIsThinking = false;
+      if (dataStr.indexOf('"content_block":{"type":"tool_use"') !== -1) {
+        toolUseBuffer = { index: evtIndex, events: [event] };
+        return '';
+      }
+      if (dataStr.indexOf('"content_block":{"type":"text"') !== -1 && evtIndex !== null) {
+        textBuffers.set(evtIndex, '');
+      }
+      return reverseMap(event, config);
+    }
+    if (dataStr.indexOf('"type":"content_block_stop"') !== -1) {
+      const wasThinking = currentBlockIsThinking;
+      currentBlockIsThinking = false;
+      if (toolUseBuffer && toolUseBuffer.index === evtIndex) {
+        const startEvent = toolUseBuffer.events[0];
+        const deltaEvents = toolUseBuffer.events.slice(1);
+        toolUseBuffer = null;
+        const PARTIAL_RE = /"partial_json":"((?:[^"\\]|\\.)*)"/;
+        const assembled = deltaEvents.map(e => {
+          const m = e.match(PARTIAL_RE);
+          return m ? m[1] : '';
+        }).join('');
+        const rewritten = reverseMap(assembled, config);
+        const synthDelta = 'event: content_block_delta\ndata: ' +
+          '{"type":"content_block_delta","index":' + evtIndex +
+          ',"delta":{"type":"input_json_delta","partial_json":"' +
+          rewritten + '"}}\n\n';
+        return reverseMap(startEvent, config) +
+               synthDelta +
+               reverseMap(event, config);
+      }
+      if (textBuffers.has(evtIndex)) {
+        const held = textBuffers.get(evtIndex);
+        textBuffers.delete(evtIndex);
+        const prefix = held.length > 0
+          ? buildTextDelta(evtIndex, reverseMap(held, config))
+          : '';
+        return prefix + reverseMap(event, config);
+      }
+      return wasThinking ? event : reverseMap(event, config);
+    }
+    if (currentBlockIsThinking) return event;
+    if (toolUseBuffer && evtIndex === toolUseBuffer.index &&
+        dataStr.indexOf('"type":"content_block_delta"') !== -1) {
+      toolUseBuffer.events.push(event);
+      return '';
+    }
+    if (textBuffers.has(evtIndex) &&
+        dataStr.indexOf('"type":"text_delta"') !== -1) {
+      const textStart = findSseStringField(dataStr, 'text');
+      if (textStart === -1) return reverseMap(event, config);
+      const { value: decoded, end } = jsonStringDecode(dataStr, textStart);
+      if (end > dataStr.length) return reverseMap(event, config);
+      const buf = textBuffers.get(evtIndex) + decoded;
+      const cut = safeCut(buf, maxReversePatternLen, config.reverseMap);
+      textBuffers.set(evtIndex, buf.slice(cut));
+      if (cut === 0) return '';
+      return buildTextDelta(evtIndex, reverseMap(buf.slice(0, cut), config));
+    }
+    return reverseMap(event, config);
+  };
+
+  // Emit anything still held in per-block buffers. Called at stream end and
+  // mid-stream truncation so the client sees the (reverse-mapped) tail
+  // rather than nothing.
+  const flushAll = () => {
+    let out = '';
+    for (const [index, held] of textBuffers) {
+      if (held.length > 0) out += buildTextDelta(index, reverseMap(held, config));
+    }
+    textBuffers.clear();
+    if (toolUseBuffer && toolUseBuffer.events.length > 0) {
+      out += reverseMap(toolUseBuffer.events.join(''), config);
+      toolUseBuffer = null;
+    }
+    return out;
+  };
+
+  return { transform, flushAll };
+}
+
+// Test-facing convenience: drive createSseEventTransformer over a sequence
+// of raw upstream chunks and return the concatenated rewritten output.
+function applySseReverseMapChunks(chunks, config) {
+  const { transform, flushAll } = createSseEventTransformer(config);
+  const decoder = new StringDecoder('utf8');
+  let pending = '';
+  let out = '';
+  for (const chunk of chunks) {
+    pending += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    let sepIdx;
+    while ((sepIdx = pending.indexOf('\n\n')) !== -1) {
+      const event = pending.slice(0, sepIdx + 2);
+      pending = pending.slice(sepIdx + 2);
+      out += transform(event);
+    }
+  }
+  pending += decoder.end();
+  if (pending.length > 0) out += transform(pending);
+  out += flushAll();
+  return out;
+}
+
 // ─── Server ─────────────────────────────────────────────────────────────────
 function startServer(config) {
   let requestCount = 0;
@@ -1133,16 +1415,11 @@ function startServer(config) {
           });
           return;
         }
-        // SSE streaming — event-aware reverseMap with thinking block passthrough.
-        // Buffer until complete SSE events (terminated by \n\n), then transform per
-        // event. Thinking/redacted_thinking blocks pass through unchanged.
-        //
-        // Tool_use blocks: their `input_json_delta` events fragment argument strings
-        // across multiple chunks, so a rewrite target like `.claude-ws/` can span two
-        // events and be missed by per-event reverseMap. We buffer all events for an
-        // active tool_use block and run reverseMap over the concatenated payload at
-        // content_block_stop, then emit atomically. Per-tool streaming latency is
-        // unchanged from the client's perspective (it doesn't execute until stop).
+        // SSE streaming — delegate to createSseEventTransformer which handles:
+        //   - thinking/redacted_thinking pass-through
+        //   - tool_use input_json_delta buffer-and-emit at content_block_stop
+        //   - text_delta streaming reverseMap with held-tail flush
+        // See the factory definition above for the per-block invariants.
         if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
           const sseHeaders = { ...upRes.headers };
           delete sseHeaders['content-length'];
@@ -1150,83 +1427,7 @@ function startServer(config) {
           res.writeHead(status, sseHeaders);
           const decoder = new StringDecoder('utf8');
           let pending = '';
-          let currentBlockIsThinking = false;
-          // { index: N, events: [...] } while a tool_use block is in flight; else null
-          let toolUseBuffer = null;
-
-          const transformEvent = (event) => {
-            let dataIdx = event.startsWith('data: ') ? 0 : event.indexOf('\ndata: ');
-            if (dataIdx === -1) return reverseMap(event, config);
-            if (dataIdx > 0) dataIdx += 1;
-            const dataLineEnd = event.indexOf('\n', dataIdx + 6);
-            const dataStr = dataLineEnd === -1
-              ? event.slice(dataIdx + 6)
-              : event.slice(dataIdx + 6, dataLineEnd);
-
-            // First "index":N in the top-level JSON identifies which content block
-            // the event belongs to. Safe because Anthropic places it before any
-            // nested JSON in delta bodies.
-            const idxMatch = dataStr.match(/"index":(\d+)/);
-            const evtIndex = idxMatch ? parseInt(idxMatch[1], 10) : null;
-
-            if (dataStr.indexOf('"type":"content_block_start"') !== -1) {
-              if (dataStr.indexOf('"content_block":{"type":"thinking"') !== -1 ||
-                  dataStr.indexOf('"content_block":{"type":"redacted_thinking"') !== -1) {
-                currentBlockIsThinking = true;
-                return event;
-              }
-              currentBlockIsThinking = false;
-              // Tool_use block: start buffering so fragmented arg strings get
-              // rewritten across delta boundaries.
-              if (dataStr.indexOf('"content_block":{"type":"tool_use"') !== -1) {
-                toolUseBuffer = { index: evtIndex, events: [event] };
-                return '';
-              }
-              return reverseMap(event, config);
-            }
-            if (dataStr.indexOf('"type":"content_block_stop"') !== -1) {
-              const wasThinking = currentBlockIsThinking;
-              currentBlockIsThinking = false;
-              // Flush tool_use buffer if this stops our block.
-              // Concat EVENTS directly fails because JSON/SSE structural bytes
-              // (`"}}\n\ndata: {…"partial_json":"`) sit between the partial_json
-              // values in the concatenated events — a target like `.claude-ws/`
-              // split across deltas won't be contiguous. Instead, extract each
-              // delta's partial_json string value, concat only those values,
-              // apply reverseMap, and emit a single synthesized delta.
-              if (toolUseBuffer && toolUseBuffer.index === evtIndex) {
-                const startEvent = toolUseBuffer.events[0];
-                const deltaEvents = toolUseBuffer.events.slice(1);
-                toolUseBuffer = null;
-                const PARTIAL_RE = /"partial_json":"((?:[^"\\]|\\.)*)"/;
-                const assembled = deltaEvents.map(e => {
-                  const m = e.match(PARTIAL_RE);
-                  return m ? m[1] : '';
-                }).join('');
-                const rewritten = reverseMap(assembled, config);
-                // Emit: (start) + (single synth delta carrying full rewritten
-                // arg string) + (stop). The client's accumulator concatenates
-                // partial_json values and JSON-parses on stop, so one delta
-                // with the full payload is semantically identical to N deltas.
-                const synthDelta = 'event: content_block_delta\ndata: ' +
-                  '{"type":"content_block_delta","index":' + evtIndex +
-                  ',"delta":{"type":"input_json_delta","partial_json":"' +
-                  rewritten + '"}}\n\n';
-                return reverseMap(startEvent, config) +
-                       synthDelta +
-                       reverseMap(event, config);
-              }
-              return wasThinking ? event : reverseMap(event, config);
-            }
-            if (currentBlockIsThinking) return event;
-            // Buffer deltas belonging to the active tool_use block.
-            if (toolUseBuffer && evtIndex === toolUseBuffer.index &&
-                dataStr.indexOf('"type":"content_block_delta"') !== -1) {
-              toolUseBuffer.events.push(event);
-              return '';
-            }
-            return reverseMap(event, config);
-          };
+          const { transform, flushAll } = createSseEventTransformer(config);
 
           upRes.on('data', (chunk) => {
             pending += decoder.write(chunk);
@@ -1234,22 +1435,14 @@ function startServer(config) {
             while ((sepIdx = pending.indexOf('\n\n')) !== -1) {
               const event = pending.slice(0, sepIdx + 2);
               pending = pending.slice(sepIdx + 2);
-              res.write(transformEvent(event));
+              res.write(transform(event));
             }
           });
           upRes.on('end', () => {
             pending += decoder.end();
-            if (pending.length > 0) {
-              res.write(transformEvent(pending));
-            }
-            // Stream closed mid tool_use (upstream error or truncation):
-            // flush what we have so the client sees the partial rather than
-            // nothing. Apply reverseMap in case any complete rewrite targets
-            // exist in the buffered prefix.
-            if (toolUseBuffer && toolUseBuffer.events.length > 0) {
-              res.write(reverseMap(toolUseBuffer.events.join(''), config));
-              toolUseBuffer = null;
-            }
+            if (pending.length > 0) res.write(transform(pending));
+            const tail = flushAll();
+            if (tail.length > 0) res.write(tail);
             res.end();
           });
         } else {
@@ -1342,5 +1535,18 @@ function startServer(config) {
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
-const config = loadConfig();
-startServer(config);
+if (require.main === module) {
+  const config = loadConfig();
+  startServer(config);
+}
+
+module.exports = {
+  loadConfig,
+  reverseMap,
+  findSseStringField,
+  jsonStringDecode,
+  jsonStringEncode,
+  safeCut,
+  createSseEventTransformer,
+  applySseReverseMapChunks,
+};
