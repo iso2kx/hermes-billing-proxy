@@ -75,6 +75,9 @@ const REQUIRED_BETAS = [
   'effort-2025-11-24',
   'fast-mode-2026-02-01'
 ];
+// Precomputed header value for the common case (no inbound anthropic-beta).
+// REQUIRED_BETAS never contains context-1m, so no filtering is needed here.
+const REQUIRED_BETAS_HEADER = REQUIRED_BETAS.join(',');
 
 // CC tool stubs -- injected into tools array to make the tool set look more
 // like a Claude Code session. The model won't call these (schemas are minimal).
@@ -149,7 +152,8 @@ function buildBillingBlock(bodyStr) {
 
 // ─── Stainless SDK Headers ──────────────────────────────────────────────────
 // Real Claude Code sends these on every request via the Anthropic JS SDK.
-function getStainlessHeaders() {
+// Every value is constant for the process lifetime, so build the object once.
+const STAINLESS_HEADERS = (() => {
   const p = process.platform;
   const osName = p === 'darwin' ? 'macOS' : p === 'win32' ? 'Windows' : p === 'linux' ? 'Linux' : p;
   const arch = process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch;
@@ -167,7 +171,7 @@ function getStainlessHeaders() {
     'x-stainless-timeout': '600',
     'anthropic-dangerous-direct-browser-access': 'true'
   };
-}
+})();
 
 // ─── Layer 2: String Trigger Replacements ───────────────────────────────────
 // Applied globally via split/join on the entire request body.
@@ -453,6 +457,15 @@ function loadConfig() {
 }
 
 // ─── Token Management ───────────────────────────────────────────────────────
+// getToken() runs on every proxied request, so the parsed credentials are
+// cached and only re-read when the file changes (mtime/size). Even the stat
+// is rate-limited (it costs ~70µs on Windows/NTFS): a window of staleness up
+// to CREDS_STAT_INTERVAL_MS is harmless because tokens are refreshed minutes
+// before expiry, and refreshCredentials() invalidates the cache directly so
+// post-refresh reads are never stale.
+const CREDS_STAT_INTERVAL_MS = 2000;
+let credsCache = null; // { path, mtimeMs, size, oauth, checkedAt }
+
 function getToken(credsPath) {
   // Env var mode: return synthetic OAuth object without file I/O
   if (credsPath === 'env') {
@@ -460,11 +473,22 @@ function getToken(credsPath) {
     if (!token) throw new Error('OAUTH_TOKEN env var is empty.');
     return { accessToken: token, expiresAt: Infinity, subscriptionType: 'env-var' };
   }
+  const now = Date.now();
+  if (credsCache && credsCache.path === credsPath) {
+    if (now - credsCache.checkedAt < CREDS_STAT_INTERVAL_MS) return credsCache.oauth;
+    const st = fs.statSync(credsPath);
+    credsCache.checkedAt = now;
+    if (credsCache.mtimeMs === st.mtimeMs && credsCache.size === st.size) {
+      return credsCache.oauth;
+    }
+  }
+  const st = fs.statSync(credsPath);
   let raw = fs.readFileSync(credsPath, 'utf8');
   if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
   const creds = JSON.parse(raw);
   const oauth = creds.claudeAiOauth;
   if (!oauth || !oauth.accessToken) throw new Error('No OAuth token. Run "claude auth login".');
+  credsCache = { path: credsPath, mtimeMs: st.mtimeMs, size: st.size, oauth, checkedAt: now };
   return oauth;
 }
 
@@ -492,6 +516,7 @@ function refreshCredentials(credsPath) {
   } catch(e) {
     console.error('[PROXY] claude CLI refresh failed: ' + (e.message || 'unknown'));
   }
+  credsCache = null; // the CLI rewrote the creds file — force a fresh read
   try { getToken(credsPath); return true; } catch(e) { return false; }
 }
 
@@ -534,6 +559,12 @@ const THINK_MASK_SUFFIX = '__';
 const THINK_BLOCK_PATTERNS = ['{"type":"thinking"', '{"type":"redacted_thinking"'];
 
 function maskThinkingBlocks(m) {
+  // Fast path: most bodies carry no thinking blocks — skip the scan-and-copy
+  // (which allocates a full copy of the body even when nothing matches).
+  if (m.indexOf(THINK_BLOCK_PATTERNS[0]) === -1 &&
+      m.indexOf(THINK_BLOCK_PATTERNS[1]) === -1) {
+    return { masked: m, masks: [] };
+  }
   const masks = [];
   let out = '';
   let i = 0;
@@ -684,70 +715,8 @@ function processBody(bodyStr, config) {
   // Layer 6: Property name renaming (single precompiled pass)
   m = replacers.fwdProps(m);
 
-  // Layer 4: System prompt template bypass
-  // Strip the OC config section (~28K of ## Tooling, ## Workspace, ## Messaging, etc.)
-  // and replace with a brief paraphrase. The config is between the identity line
-  // ("You are a personal assistant") and the first workspace doc (AGENTS.md header).
-  // IMPORTANT: Search WITHIN the system array, not from the start of the body.
-  // The identity line can appear in conversation history (from prior discussions),
-  // and matching there instead of the system prompt causes the strip to fail.
-  if (false) { // DISABLED: old string-based strip corrupts JSON for Hermes
-    // JSON-aware strip at end of processBody() handles this instead
-    // Hermes: the entire system prompt block [2] is SOUL.md + memory + skills (~19K)
-    // which acts as a fingerprint. Strip it and replace with a brief paraphrase.
-    // Strategy: find the SOUL.md content block and replace it entirely.
-    const IDENTITY_MARKER = '# SOUL.md';
-    // Also try the OC-style marker
-    const OC_IDENTITY_MARKER = 'You are a personal assistant';
-    const sysArrayStart = m.indexOf('"system":[');
-    const searchFrom = sysArrayStart !== -1 ? sysArrayStart : 0;
-    let configStart = m.indexOf(IDENTITY_MARKER, searchFrom);
-    if (configStart === -1) configStart = m.indexOf(OC_IDENTITY_MARKER, searchFrom);
-    if (configStart !== -1) {
-      let stripFrom = configStart;
-      if (stripFrom >= 2 && m[stripFrom - 2] === '\\' && m[stripFrom - 1] === 'n') {
-        stripFrom -= 2;
-      }
-      // For Hermes: find end of this text block (closing quote of the system text value)
-      // Look for the end of the system text content — either next block boundary or
-      // workspace doc header (OC-style)
-      let configEnd = m.indexOf('\\n## /', configStart + 10);
-      if (configEnd === -1) configEnd = m.indexOf('\\n## C:\\\\', configStart + 10);
-      // Hermes fallback: find the closing of this system text block
-      // The text ends at an unescaped quote: "},{  or "}]  
-      if (configEnd === -1) {
-        // Find end of the text value containing SOUL.md
-        // Search for the pattern that closes a system block: "},{ or "}]
-        let searchPos = configStart + 100;
-        while (searchPos < m.length) {
-          const endBlock = m.indexOf('"},', searchPos);
-          const endArray = m.indexOf('"}]', searchPos);
-          if (endBlock === -1 && endArray === -1) break;
-          configEnd = endBlock !== -1 ? endBlock : endArray;
-          if (endArray !== -1 && (endBlock === -1 || endArray < endBlock)) configEnd = endArray;
-          break;
-        }
-      }
-      if (configEnd !== -1) {
-        const boundary = configEnd;
-
-        const strippedLen = boundary - stripFrom;
-        if (strippedLen > 1000) {
-          const PARAPHRASE =
-            '\\nYou are an AI operations assistant with access to all tools listed in this request ' +
-            'for file operations, command execution, web search, browser control, scheduling, ' +
-            'messaging, and session management. Tool names are case-sensitive and must be called ' +
-            'exactly as listed. Your responses route to the active channel automatically. ' +
-            'For cross-session communication, use the task messaging tools. ' +
-            'Skills defined in your workspace should be invoked when they match user requests. ' +
-            'Consult your workspace reference files for detailed operational configuration.\\n';
-
-          m = m.slice(0, stripFrom) + PARAPHRASE + m.slice(boundary);
-          console.log(`[STRIP] Removed ${strippedLen} chars of config template`);
-        }
-      }
-    }
-  }
+  // Layer 4 (system prompt template strip) lives in the JSON-aware pass at the
+  // end of this function — the old string-boundary version corrupted Hermes JSON.
 
   // Layer 5: Tool description stripping
   if (config.stripToolDescriptions) {
@@ -1403,7 +1372,17 @@ function startServer(config) {
 
       let bodyStr = body.toString('utf8');
       const originalSize = bodyStr.length;
-      bodyStr = processBody(bodyStr, config);
+      // Fail closed on transform bugs: forwarding an unsanitized body would
+      // defeat the proxy, and an uncaught throw here leaves the client hanging
+      // until its socket timeout.
+      try {
+        bodyStr = processBody(bodyStr, config);
+      } catch (e) {
+        console.error(`[PROXY] #${reqNum} processBody failed: ${e.message}`);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_transform_error', message: e.message } }));
+        return;
+      }
       body = Buffer.from(bodyStr, 'utf8');
 
       const headers = {};
@@ -1420,20 +1399,20 @@ function startServer(config) {
       headers['anthropic-version'] = '2023-06-01';
 
       // Inject Stainless SDK + Claude Code identity headers
-      const ccHeaders = getStainlessHeaders();
-      for (const [k, v] of Object.entries(ccHeaders)) {
-        headers[k] = v;
-      }
+      Object.assign(headers, STAINLESS_HEADERS);
 
       const existingBeta = headers['anthropic-beta'] || '';
-      const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
-      for (const b of REQUIRED_BETAS) { if (!betas.includes(b)) betas.push(b); }
-      // Max-subscription OAuth doesn't include 1M context access; the header
-      // 400s on models without 1M (haiku-4-5) and is a no-op on models where
-      // 1M is GA (opus-4-6/4-7, sonnet-4-6 on api.anthropic.com). Claude Code
-      // itself never sends it on OAuth — match that.
-      const filteredBetas = betas.filter(b => b !== 'context-1m-2025-08-07');
-      headers['anthropic-beta'] = filteredBetas.join(',');
+      if (!existingBeta) {
+        headers['anthropic-beta'] = REQUIRED_BETAS_HEADER;
+      } else {
+        const betas = existingBeta.split(',').map(b => b.trim());
+        for (const b of REQUIRED_BETAS) { if (!betas.includes(b)) betas.push(b); }
+        // Max-subscription OAuth doesn't include 1M context access; the header
+        // 400s on models without 1M (haiku-4-5) and is a no-op on models where
+        // 1M is GA (opus-4-6/4-7, sonnet-4-6 on api.anthropic.com). Claude Code
+        // itself never sends it on OAuth — match that.
+        headers['anthropic-beta'] = betas.filter(b => b !== 'context-1m-2025-08-07').join(',');
+      }
 
       const ts = new Date().toISOString().substring(11, 19);
       console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${originalSize}b -> ${body.length}b)`);
