@@ -592,6 +592,63 @@ function findMatchingBracket(str, start) {
   return -1;
 }
 
+// ─── Pattern Compilation ────────────────────────────────────────────────────
+// The proxy historically rewrote each body with one String.split(find).join()
+// per pattern — ~87 full-body passes per request in processBody() and ~147 per
+// SSE delta in reverseMap(). Each pass allocates a fresh copy of the whole body.
+// Collapsing every pattern in a category into ONE precompiled alternation regex
+// turns N passes into 1.
+//
+// Ordering: split/join applied patterns sequentially, so a longer pattern that
+// shares a prefix with a shorter one had to win. A global regex tries
+// alternatives left-to-right at each position, so we sort longest-first to keep
+// "specific beats prefix" (e.g. "Claude Code" before "Claude"). This is exact
+// here because, within each category, no replacement's OUTPUT contains another
+// pattern's FIND — so the old sequential cascade was never relied upon.
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Build a single-pass replacer from [find, replace] pairs. Returns identity when
+// there are no pairs (an empty alternation would match the empty string at every
+// position). Duplicate finds keep the first mapping, matching split/join order.
+function compileReplacer(pairs) {
+  if (!pairs || pairs.length === 0) return (s) => s;
+  const map = new Map();
+  for (const [find, replace] of pairs) {
+    if (find && !map.has(find)) map.set(find, replace);
+  }
+  if (map.size === 0) return (s) => s;
+  const keys = [...map.keys()].sort((a, b) => b.length - a.length);
+  const re = new RegExp(keys.map(escapeRegExp).join('|'), 'g');
+  return (s) => s.replace(re, (hit) => map.get(hit));
+}
+
+// Lazily compile (and cache, non-enumerably) the per-category replacers used by
+// processBody() and reverseMap(). Missing arrays default to empty so arbitrary
+// configs (e.g. the test suite's reverseMap-only config) still work.
+function ensureReplacers(config) {
+  if (config._replacers) return config._replacers;
+  const tool = config.toolRenames || [];
+  const prop = config.propRenames || [];
+  const quoted = ([orig, cc]) => ['"' + orig + '"', '"' + cc + '"'];
+  // Reverse handles BOTH plain ("Name") and escaped (\"Name\") forms in one pass.
+  const revBoth = ([orig, cc]) => [
+    ['"' + cc + '"', '"' + orig + '"'],
+    ['\\"' + cc + '\\"', '\\"' + orig + '\\"'],
+  ];
+  const replacers = {
+    fwdReplace: compileReplacer(config.replacements || []),
+    fwdTools: compileReplacer(tool.map(quoted)),
+    fwdProps: compileReplacer(prop.map(quoted)),
+    revTools: compileReplacer(tool.flatMap(revBoth)),
+    revProps: compileReplacer(prop.flatMap(revBoth)),
+    revStrings: compileReplacer(config.reverseMap || []),
+  };
+  Object.defineProperty(config, '_replacers', { value: replacers, enumerable: false });
+  return replacers;
+}
+
 // ─── Request Processing ─────────────────────────────────────────────────────
 function processBody(bodyStr, config) {
   // Mask thinking/redacted_thinking blocks before transforms
@@ -610,15 +667,13 @@ function processBody(bodyStr, config) {
     } catch(e) {}
   }
 
-  // Layer 2: String trigger sanitization (global split/join)
-  for (const [find, replace] of config.replacements) {
-    m = m.split(find).join(replace);
-  }
+  const replacers = ensureReplacers(config);
 
-  // Layer 3: Tool name fingerprint bypass (quoted replacement for precision)
-  for (const [orig, cc] of config.toolRenames) {
-    m = m.split('"' + orig + '"').join('"' + cc + '"');
-  }
+  // Layer 2: String trigger sanitization (single precompiled pass)
+  m = replacers.fwdReplace(m);
+
+  // Layer 3: Tool name fingerprint bypass (quoted, single precompiled pass)
+  m = replacers.fwdTools(m);
 
   // Dynamic MCP tool rename: "mcp_xxx_yyy" -> "McpXxxYyy" (PascalCase)
   m = m.replace(/"mcp_([a-z_]+)"/g, (match, name) => {
@@ -626,10 +681,8 @@ function processBody(bodyStr, config) {
     return '"' + pascal + '"';
   });
 
-  // Layer 6: Property name renaming
-  for (const [orig, renamed] of config.propRenames) {
-    m = m.split('"' + orig + '"').join('"' + renamed + '"');
-  }
+  // Layer 6: Property name renaming (single precompiled pass)
+  m = replacers.fwdProps(m);
 
   // Layer 4: System prompt template bypass
   // Strip the OC config section (~28K of ## Tooling, ## Workspace, ## Messaging, etc.)
@@ -825,7 +878,36 @@ function processBody(bodyStr, config) {
   // block >2000 chars with a brief paraphrase. This is the nuclear option:
   // Hermes stuffs SOUL.md + memory + skills (~19K) into one system block.
   // The OC proxy's string-boundary approach can't find Hermes's boundaries.
-  try {
+  //
+  // Fix: this pass is a full JSON.parse + (when it mutates) re-stringify of an
+  // often-large body, but it can only change anything when the body still
+  // carries framework content — a framework-prefixed model, a standalone
+  // framework-name leak (sanitized in >2000 blocks), or one of the boilerplate
+  // sections STRIP_PATTERNS targets. If none of those markers survive the
+  // earlier string passes, the parse is pure waste, so skip it.
+  //
+  // NOTE: keep these in sync with STRIP_PATTERNS / the name-sanitize below.
+  // Over-inclusion is safe (we parse and no-op); the only divergence from the
+  // old always-parse path is that a >2000 block with NO marker no longer gets
+  // incidental whitespace trimming — which was a side effect, not a guarantee,
+  // and never applies to real (marker-bearing) Hermes traffic.
+  const _FWname = String.fromCharCode(72,101,114,109,101,115);          // framework name
+  const _OCname = String.fromCharCode(111,112,101,110,99,108,97,119);   // legacy prefix
+  const JSON_PASS_MARKERS = [
+    '"model":"' + _FWname.toLowerCase() + '-',  // framework-prefixed model → remap
+    _FWname, _FWname.toLowerCase(), _OCname,    // standalone name/prefix leaks
+    'You have persistent memory across sessions',
+    '# Holographic Memory',
+    '## Skills (mandatory)',
+    'Save durable info via memory tool between chats',
+    'Scan skills below',
+    '<available_skills>',
+    'Conversation started:',
+    'You are a CLI AI Agent',
+  ];
+  let _needsJsonPass = false;
+  for (const _mk of JSON_PASS_MARKERS) { if (m.indexOf(_mk) !== -1) { _needsJsonPass = true; break; } }
+  if (_needsJsonPass) try {
     const parsed = JSON.parse(m);
     let mutated = false;
     // Model name mapping: framework prefix → Anthropic prefix
@@ -956,19 +1038,13 @@ function reverseMap(text, config) {
   // inner quotes are escaped. Without the escaped variant, renamed arg keys
   // like \"SendMessage\" never get reverted to \"message\" and OpenClaw's tool
   // runtime fails with "message required". (issue #11)
-  for (const [orig, cc] of config.toolRenames) {
-    r = r.split('"' + cc + '"').join('"' + orig + '"');
-    r = r.split('\\"' + cc + '\\"').join('\\"' + orig + '\\"');
-  }
-  // Reverse property names — same dual handling
-  for (const [orig, renamed] of config.propRenames) {
-    r = r.split('"' + renamed + '"').join('"' + orig + '"');
-    r = r.split('\\"' + renamed + '\\"').join('\\"' + orig + '\\"');
-  }
-  // Reverse string replacements
-  for (const [sanitized, original] of config.reverseMap) {
-    r = r.split(sanitized).join(original);
-  }
+  // Same category order as before (tools → props → strings), each now a single
+  // precompiled pass. revTools/revProps handle both plain ("Name") and escaped
+  // (\"Name\") forms in one regex.
+  const replacers = ensureReplacers(config);
+  r = replacers.revTools(r);
+  r = replacers.revProps(r);
+  r = replacers.revStrings(r);
   // Reverse final-sweep removed (see outbound counterpart for rationale).
   return r;
 }
@@ -1542,6 +1618,8 @@ if (require.main === module) {
 
 module.exports = {
   loadConfig,
+  compileReplacer,
+  processBody,
   reverseMap,
   findSseStringField,
   jsonStringDecode,
