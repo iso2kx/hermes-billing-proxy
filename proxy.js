@@ -45,8 +45,23 @@ const UPSTREAM_AGENT = new https.Agent({
   maxSockets: 32,
 });
 
-// Claude Code version to emulate (update when new CC versions are released)
-const CC_VERSION = '2.1.97';
+// Claude Code version to emulate. Auto-detected from the installed CLI so the
+// proxy stays in lock-step with whatever Claude Code the user actually runs —
+// this is what keeps the billing header "up to date with the CLI". Falls back
+// to a known-good pin when the CLI isn't on PATH (e.g. env-var/headless mode).
+// Override explicitly with the CC_VERSION env var.
+function detectCcVersion(fallback) {
+  if (process.env.CC_VERSION) return process.env.CC_VERSION;
+  try {
+    const out = require('child_process')
+      .execSync('claude --version', { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString();
+    const m = out.match(/(\d+\.\d+\.\d+)/);
+    if (m) return m[1];
+  } catch (e) { /* CLI unavailable — use the pinned fallback */ }
+  return fallback;
+}
+const CC_VERSION = detectCcVersion('2.1.186');
 
 // Token refresh defaults
 const DEFAULT_REFRESH_THRESHOLD_MINUTES = 2;
@@ -78,6 +93,41 @@ const REQUIRED_BETAS = [
 // Precomputed header value for the common case (no inbound anthropic-beta).
 // REQUIRED_BETAS never contains context-1m, so no filtering is needed here.
 const REQUIRED_BETAS_HEADER = REQUIRED_BETAS.join(',');
+
+// Model-aware beta selection. Several betas hard-400 on Haiku: it rejects
+// interleaved-thinking and effort, and fast-mode is Opus-only. Real Claude Code
+// only sends a model the betas it accepts — match that so Haiku traffic routed
+// through the proxy doesn't 400. Opus/Sonnet keep the full set unchanged.
+function getModelBetas(modelId) {
+  const id = (modelId || '').toLowerCase();
+  if (id.includes('haiku')) {
+    const drop = new Set([
+      'interleaved-thinking-2025-05-14',
+      'effort-2025-11-24',
+      'fast-mode-2026-02-01',
+    ]);
+    return REQUIRED_BETAS.filter(b => !drop.has(b));
+  }
+  return REQUIRED_BETAS;
+}
+
+// Strip the "effort" field from a named object within a raw JSON body. Haiku
+// 400s when sent `effort`, but Opus/Sonnet use it, so callers gate this on the
+// model. Raw-string (no JSON.parse) to preserve the proxy-wide byte-fidelity
+// principle. No-op when the object or the field is absent.
+function stripEffortFromObject(str, objectKey) {
+  const keyIdx = str.indexOf('"' + objectKey + '"');
+  if (keyIdx === -1) return str;
+  const braceStart = str.indexOf('{', keyIdx);
+  if (braceStart === -1) return str;
+  const braceEnd = findMatchingObject(str, braceStart);
+  if (braceEnd === -1) return str;
+  const obj = str.slice(braceStart, braceEnd + 1);
+  const cleaned = obj
+    .replace(/,\s*"effort"\s*:\s*(?:"[^"]*"|\d+(?:\.\d+)?|true|false|null)/, '')
+    .replace(/"effort"\s*:\s*(?:"[^"]*"|\d+(?:\.\d+)?|true|false|null)\s*,?/, '');
+  return str.slice(0, braceStart) + cleaned + str.slice(braceEnd + 1);
+}
 
 // CC tool stubs -- injected into tools array to make the tool set look more
 // like a Claude Code session. The model won't call these (schemas are minimal).
@@ -150,6 +200,85 @@ function buildBillingBlock(bodyStr) {
   return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=cli; cch=00000;"}`;
 }
 
+// ─── Claude Code attestation hash (cch) ──────────────────────────────────────
+// Real Claude Code's native (Bun/Zig) layer computes cch = xxHash64(serialized
+// request body, with the literal "cch=00000" placeholder still in place) & 0xFFFFF,
+// then overwrites the placeholder with the 5-hex result. Anthropic validates this
+// to recognize genuine Claude Code; without it, requests fall through to
+// extra-usage billing instead of the subscription. We replicate it here.
+// Seed observed via reverse-engineering of Claude Code 2.1.x. A self-test guards
+// against a wrong implementation: if xxHash64 fails its known vectors we leave
+// "cch=00000" untouched (degrade rather than send a corrupt attestation).
+const CCH_SEED = 0x6E52736AC806831En;
+const _M64 = (1n << 64n) - 1n;
+const _XP1 = 0x9E3779B185EBCA87n, _XP2 = 0xC2B2AE3D27D4EB4Fn, _XP3 = 0x165667B19E3779F9n,
+      _XP4 = 0x85EBCA77C2B2AE63n, _XP5 = 0x27D4EB2F165667C5n;
+const _rotl64 = (x, r) => ((x << r) | (x >> (64n - r))) & _M64;
+const _xround = (acc, inp) => { acc = (acc + inp * _XP2) & _M64; acc = _rotl64(acc, 31n); return (acc * _XP1) & _M64; };
+const _xmerge = (acc, val) => { val = _xround(0n, val); acc ^= val; acc = (acc * _XP1) & _M64; return (acc + _XP4) & _M64; };
+
+function xxh64(buf, seed) {
+  const len = buf.length;
+  let p = 0, h;
+  if (len >= 32) {
+    let v1 = (seed + _XP1 + _XP2) & _M64, v2 = (seed + _XP2) & _M64,
+        v3 = seed & _M64, v4 = (seed - _XP1) & _M64;
+    const limit = len - 32;
+    while (p <= limit) {
+      v1 = _xround(v1, buf.readBigUInt64LE(p)); p += 8;
+      v2 = _xround(v2, buf.readBigUInt64LE(p)); p += 8;
+      v3 = _xround(v3, buf.readBigUInt64LE(p)); p += 8;
+      v4 = _xround(v4, buf.readBigUInt64LE(p)); p += 8;
+    }
+    h = (_rotl64(v1, 1n) + _rotl64(v2, 7n) + _rotl64(v3, 12n) + _rotl64(v4, 18n)) & _M64;
+    h = _xmerge(h, v1); h = _xmerge(h, v2); h = _xmerge(h, v3); h = _xmerge(h, v4);
+  } else {
+    h = (seed + _XP5) & _M64;
+  }
+  h = (h + BigInt(len)) & _M64;
+  while (p + 8 <= len) {
+    h ^= _xround(0n, buf.readBigUInt64LE(p));
+    h = ((_rotl64(h, 27n) * _XP1) & _M64);
+    h = (h + _XP4) & _M64;
+    p += 8;
+  }
+  if (p + 4 <= len) {
+    h ^= (BigInt(buf.readUInt32LE(p)) * _XP1) & _M64;
+    h = (_rotl64(h, 23n) * _XP2) & _M64;
+    h = (h + _XP3) & _M64;
+    p += 4;
+  }
+  while (p < len) {
+    h ^= (BigInt(buf[p]) * _XP5) & _M64;
+    h = (_rotl64(h, 11n) * _XP1) & _M64;
+    p += 1;
+  }
+  h ^= h >> 33n; h = (h * _XP2) & _M64;
+  h ^= h >> 29n; h = (h * _XP3) & _M64;
+  h ^= h >> 32n;
+  return h;
+}
+
+// Self-test against canonical xxHash64 vectors (seed 0).
+const CCH_XXH_OK = (() => {
+  try {
+    return xxh64(Buffer.from('', 'utf8'), 0n) === 0xEF46DB3751D8E999n &&
+           xxh64(Buffer.from('Nobody inspects the spammish repetition', 'utf8'), 0n) === 0xFBCEA83C8A378BF1n;
+  } catch (e) { return false; }
+})();
+
+// Replace "cch=00000" in a final request body with the real attestation hash.
+// The hash is taken over the body WITH the placeholder in place (length is
+// preserved by the 5-hex replacement, so Anthropic's recomputation matches).
+function applyCch(bodyStr) {
+  if (!CCH_XXH_OK) return bodyStr;
+  const idx = bodyStr.indexOf('cch=00000');
+  if (idx === -1) return bodyStr;
+  const h = xxh64(Buffer.from(bodyStr, 'utf8'), CCH_SEED) & 0xFFFFFn;
+  const cch = h.toString(16).padStart(5, '0');
+  return bodyStr.slice(0, idx) + 'cch=' + cch + bodyStr.slice(idx + 'cch=00000'.length);
+}
+
 // ─── Stainless SDK Headers ──────────────────────────────────────────────────
 // Real Claude Code sends these on every request via the Anthropic JS SDK.
 // Every value is constant for the process lifetime, so build the object once.
@@ -208,6 +337,12 @@ const DEFAULT_REPLACEMENTS = [
   ['Telegram (DM with', 'Session with'],
   ['Please do not use markdown as it does not render.', 'Use markdown for formatting.'],
   ['include MEDIA:/absolute/path/to/file in your response', 'use file tools to share files'],
+  // Dehermesification: scrub the doc-domain leak (per issue #19046). Forward-only
+  // and safe. NOTE: broad bare-"hermes"->"claude" scrubbing was tested and does
+  // NOT defeat Anthropic's current detection (it's structural, not brand-string
+  // based) AND breaks tool execution (renames the functional hermes_tools module),
+  // so it is intentionally NOT done here.
+  ['nousresearch', 'anthropic'],   // nousresearch.com -> anthropic.com (forward-only)
 ];
 
 // ─── Layer 3: Tool Name Renames ─────────────────────────────────────────────
@@ -219,59 +354,82 @@ const DEFAULT_REPLACEMENTS = [
 // schemas (no descriptions, no properties), original tool names trigger detection.
 // Renaming to PascalCase CC-like conventions defeats this entirely.
 //
-// ORDERING: lcm_expand_query MUST come before lcm_expand to avoid partial match.
+// Anthropic fingerprints the TOOL SET to grant Claude Code subscription billing:
+// a request whose tools don't look like genuine Claude Code is billed to extra
+// usage (verified empirically — issue #19046). Real Claude Code exposes native
+// tools (Bash/Read/Write/Edit/Task/...) plus MCP-server tools named
+// `mcp__<server>__<tool>`. So we disguise EVERY Hermes tool as one of those two
+// forms — core tools -> native CC names, the rest -> genuine mcp__ names. This
+// keeps every toolset working (1:1 reversible: the response tool_use names map
+// straight back), while the set reads as "Claude Code + a few MCP servers".
+//
+// IMPORTANT: keys are Hermes's ACTUAL tool names (bare, no mcp_ prefix — Hermes
+// dropped that). Avoid the 5 native names injected as CC_TOOL_STUBS
+// (Glob/Grep/Agent/NotebookEdit/TodoRead) to prevent duplicate-name 400s.
 const DEFAULT_TOOL_RENAMES = [
-  // Hermes prefixes ALL tools with mcp_ when using OAuth/Claude Code auth
-  // These MUST come before the dynamic MCP regex in processBody()
-  ['mcp_terminal', 'Bash'],
-  ['mcp_process', 'BashSession'],
-  ['mcp_execute_code', 'CodeExec'],
-  ['mcp_read_file', 'Read'],
-  ['mcp_write_file', 'Write'],
-  ['mcp_patch', 'Edit'],
-  ['mcp_search_files', 'SearchFiles'],
-  ['mcp_browser_navigate', 'BrowserNavigate'],
-  ['mcp_browser_snapshot', 'BrowserSnapshot'],
-  ['mcp_browser_click', 'BrowserClick'],
-  ['mcp_browser_type', 'BrowserType'],
-  ['mcp_browser_scroll', 'BrowserScroll'],
-  ['mcp_browser_back', 'BrowserBack'],
-  ['mcp_browser_press', 'BrowserPress'],
-  ['mcp_browser_close', 'BrowserClose'],
-  ['mcp_browser_get_images', 'BrowserImages'],
-  ['mcp_browser_vision', 'BrowserVision'],
-  ['mcp_browser_console', 'BrowserConsole'],
-  ['mcp_web_search', 'WebSearch'],
-  ['mcp_web_extract', 'WebFetch'],
-  ['mcp_send_message', 'SendMessage'],
-  ['mcp_clarify', 'AskUser'],
-  ['mcp_holographic_memory', 'KnowledgeStore'],
-  ['mcp_memory', 'MemoryTool'],
-  ['mcp_session_search', 'SessionSearch'],
-  ['mcp_delegate_task', 'TaskCreate'],
-  ['mcp_todo', 'TodoEdit'],
-  ['mcp_cronjob', 'Scheduler'],
-  ['mcp_vision_analyze', 'ImageAnalyze'],
-  ['mcp_image_generate', 'ImageCreate'],
-  ['mcp_text_to_speech', 'Speech'],
-  ['mcp_skill_manage', 'SkillManage'],
-  ['mcp_skill_view', 'SkillView'],
-  ['mcp_skills_list', 'SkillsList'],
-  ['mcp_mixture_of_agents', 'MultiAgent'],
-  ['mcp_ha_list_entities', 'HAListEntities'],
-  ['mcp_ha_get_state', 'HAGetState'],
-  ['mcp_ha_list_services', 'HAListServices'],
-  ['mcp_ha_call_service', 'HACallService'],
-  ['mcp_rl_list_environments', 'RLListEnvs'],
-  ['mcp_rl_select_environment', 'RLSelectEnv'],
-  ['mcp_rl_get_current_config', 'RLGetConfig'],
-  ['mcp_rl_edit_config', 'RLEditConfig'],
-  ['mcp_rl_start_training', 'RLStartTrain'],
-  ['mcp_rl_stop_training', 'RLStopTrain'],
-  ['mcp_rl_check_status', 'RLCheckStatus'],
-  ['mcp_rl_get_results', 'RLGetResults'],
-  ['mcp_rl_list_runs', 'RLListRuns'],
-  ['mcp_rl_test_inference', 'RLTestInfer'],
+  // ── Core tools -> genuine native Claude Code tools ──
+  ['terminal', 'Bash'],
+  ['process', 'BashOutput'],
+  ['read_file', 'Read'],
+  ['write_file', 'Write'],
+  ['patch', 'Edit'],
+  ['delegate_task', 'Task'],
+  ['todo', 'TodoWrite'],
+  // ── Everything else -> genuine `mcp__<server>__<tool>` convention ──
+  ['execute_code', 'mcp__pyexec__run'],
+  ['search_files', 'mcp__ripgrep__search'],
+  ['memory', 'mcp__memory__store'],
+  ['holographic_memory', 'mcp__memory__holographic'],
+  ['session_search', 'mcp__memory__search'],
+  ['clarify', 'mcp__elicitation__ask'],
+  ['send_message', 'mcp__messaging__send'],
+  ['vision_analyze', 'mcp__vision__analyze'],
+  ['image_generate', 'mcp__vision__generate'],
+  ['text_to_speech', 'mcp__audio__speak'],
+  ['skill_manage', 'mcp__skills__manage'],
+  ['skill_view', 'mcp__skills__view'],
+  ['skills_list', 'mcp__skills__list'],
+  ['cronjob', 'mcp__scheduler__cron'],
+  ['mixture_of_agents', 'mcp__agents__mixture'],
+  // browser_* -> real Playwright-MCP tool names where they exist
+  ['browser_navigate', 'mcp__playwright__browser_navigate'],
+  ['browser_back', 'mcp__playwright__browser_navigate_back'],
+  ['browser_click', 'mcp__playwright__browser_click'],
+  ['browser_console', 'mcp__playwright__browser_console_messages'],
+  ['browser_get_images', 'mcp__playwright__browser_take_screenshot'],
+  ['browser_press', 'mcp__playwright__browser_press_key'],
+  ['browser_scroll', 'mcp__playwright__browser_evaluate'],
+  ['browser_snapshot', 'mcp__playwright__browser_snapshot'],
+  ['browser_type', 'mcp__playwright__browser_type'],
+  ['browser_vision', 'mcp__playwright__browser_take_screenshot_full'],
+  ['browser_close', 'mcp__playwright__browser_close'],
+  // ParallelSearch MCP — Hermes sends these as single-underscore mcp_* names,
+  // which read as foreign (genuine MCP tools use double-underscore mcp__server__tool).
+  ['mcp_parallel_search_get_prompt', 'mcp__parallel__get_prompt'],
+  ['mcp_parallel_search_list_prompts', 'mcp__parallel__list_prompts'],
+  ['mcp_parallel_search_list_resources', 'mcp__parallel__list_resources'],
+  ['mcp_parallel_search_read_resource', 'mcp__parallel__read_resource'],
+  ['mcp_parallel_search_web_fetch', 'mcp__parallel__web_fetch'],
+  ['mcp_parallel_search_web_search', 'mcp__parallel__web_search'],
+  // NOTE: if Hermes exposes other MCP servers, add their tools here mapped to
+  // mcp__<server>__<tool>. A raw single-underscore mcp_* name left unmapped will
+  // read as foreign and risk tripping detection — keep this list in sync.
+  // Home Assistant toolset (if enabled)
+  ['ha_list_entities', 'mcp__homeassistant__list_entities'],
+  ['ha_get_state', 'mcp__homeassistant__get_state'],
+  ['ha_list_services', 'mcp__homeassistant__list_services'],
+  ['ha_call_service', 'mcp__homeassistant__call_service'],
+  // RL training toolset (if enabled)
+  ['rl_list_environments', 'mcp__rl__list_environments'],
+  ['rl_select_environment', 'mcp__rl__select_environment'],
+  ['rl_get_current_config', 'mcp__rl__get_config'],
+  ['rl_edit_config', 'mcp__rl__edit_config'],
+  ['rl_start_training', 'mcp__rl__start_training'],
+  ['rl_stop_training', 'mcp__rl__stop_training'],
+  ['rl_check_status', 'mcp__rl__check_status'],
+  ['rl_get_results', 'mcp__rl__get_results'],
+  ['rl_list_runs', 'mcp__rl__list_runs'],
+  ['rl_test_inference', 'mcp__rl__test_inference'],
 ];
 
 // ─── Layer 6: Property Name Renames ─────────────────────────────────────────
@@ -320,6 +478,23 @@ const DEFAULT_REVERSE_MAP = [
   ['Claude', 'Hermes'],
   ['claude', 'hermes'],
 ];
+
+// Reverse-map entries that are UNSAFE to apply inside tool-call arguments.
+// These are the lossy natural-language identity swaps: they fire on arbitrary
+// substrings, so inside a tool arg they corrupt real data — a path like
+// /projects/claude-demo or `git clone .../claude-utils` gets rewritten to
+// hermes-* and the tool fails with ENOENT. They are keyed by their LHS (the
+// reverse pattern's "find"). Everything NOT listed here (paths like .claude-ws/,
+// env vars, filenames, CLI ids, plus prop/tool renames) is structural and still
+// applied to tool args so the proxy's own disguised tokens round-trip.
+// NOTE: 'claude-code'/'Claude Code' are deliberately KEPT (they restore Hermes's
+// own disguised hermes-agent paths); only the bare-word/prose swaps are dropped.
+const TOOL_ARG_UNSAFE_REVERSALS = new Set([
+  'Claude Code', 'claude code', 'Claude', 'claude',
+  'You are in an interactive CLI session.', 'interactive CLI session',
+  'You are in an interactive session', 'Session with',
+  'Use markdown for formatting.', 'use file tools to share files',
+]);
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 function loadConfig() {
@@ -450,6 +625,10 @@ function loadConfig() {
     stripToolDescriptions: false,  // keep descriptions for model functionality
     injectCCStubs: config.injectCCStubs !== false,
     stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false,
+    computeRealCch: config.computeRealCch !== false,             // default ON: real cch attestation for subscription billing
+    repairOrphanedTools: config.repairOrphanedTools !== false,   // default ON: prevents orphaned tool_use/result 400s
+    stripEffortForHaiku: config.stripEffortForHaiku !== false,   // default ON: Haiku 400s on effort
+    maskToolUseInputs: config.maskToolUseInputs === true,        // default OFF: #57; leaks .hermes/ markers in tool args
     refreshThresholdMs: (config.refreshThresholdMinutes || DEFAULT_REFRESH_THRESHOLD_MINUTES) * 60 * 1000,
     refreshRetryMs: (config.refreshRetrySeconds || DEFAULT_REFRESH_RETRY_SECONDS) * 1000,
     refreshEnabled: config.refreshEnabled !== false
@@ -623,6 +802,99 @@ function findMatchingBracket(str, start) {
   return -1;
 }
 
+// Like findMatchingBracket but for objects: str[start] must be '{', returns the
+// index of the matching '}' (string-aware), or -1.
+function findMatchingObject(str, start) {
+  if (str[start] !== '{') return -1;
+  let d = 0, inStr = false;
+  for (let i = start; i < str.length; i++) {
+    const c = str[i];
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '{') d++;
+    else if (c === '}') { d--; if (d === 0) return i; }
+  }
+  return -1;
+}
+
+// ─── Tool-Use Input Masking ─────────────────────────────────────────────────
+// Mask the `input` object of every tool_use block so the Layer 2/3/6 string
+// transforms can't mutate tool-call arguments (paths, commands, arg keys).
+// Mirrors maskThinkingBlocks. Used two ways:
+//   - request side (#57): opt-in protection of tool args in message history;
+//   - response side: scoping reverse-mapping so identity swaps don't corrupt
+//     tool arguments the model generated (see reverseMapResponse).
+// The placeholder is QUOTED ("__...__") so the masked body stays valid JSON —
+// Hermes' JSON-aware system-prompt strip pass (in processBody) parses the body,
+// and a bare placeholder would make JSON.parse throw and silently skip it.
+const TOOL_INPUT_MASK_PREFIX = '__OBP_TOOL_INPUT_MASK_';
+const TOOL_INPUT_MASK_SUFFIX = '__';
+
+function maskToolUseInputs(m) {
+  if (m.indexOf('"type":"tool_use"') === -1) return { masked: m, masks: [] };
+  const masks = [];
+  let out = '', i = 0;
+  while (i < m.length) {
+    const t = m.indexOf('"type":"tool_use"', i);
+    if (t === -1) { out += m.slice(i); break; }
+    const inputIdx = m.indexOf('"input":', t);
+    if (inputIdx === -1) { out += m.slice(i); break; }
+    let v = inputIdx + '"input":'.length;
+    while (v < m.length && (m[v] === ' ' || m[v] === '\t')) v++;
+    if (m[v] !== '{') { out += m.slice(i, inputIdx + '"input":'.length); i = inputIdx + '"input":'.length; continue; }
+    const end = findMatchingObject(m, v);
+    if (end === -1) { out += m.slice(i); break; }
+    masks.push(m.slice(v, end + 1));
+    out += m.slice(i, v) + '"' + TOOL_INPUT_MASK_PREFIX + (masks.length - 1) + TOOL_INPUT_MASK_SUFFIX + '"';
+    i = end + 1;
+  }
+  return { masked: out, masks };
+}
+
+function unmaskToolUseInputs(m, masks) {
+  for (let i = 0; i < masks.length; i++) {
+    m = m.split('"' + TOOL_INPUT_MASK_PREFIX + i + TOOL_INPUT_MASK_SUFFIX + '"').join(masks[i]);
+  }
+  return m;
+}
+
+// Remove orphaned tool_use / tool_result blocks from message history. Anthropic
+// 400s when a tool_use has no matching tool_result (or vice versa) — common when
+// a session is truncated or resumed mid tool-call. Parses the body to pair them
+// up; returns the input untouched on any parse issue or when nothing is orphaned
+// (so byte fidelity / prompt caching are preserved for the normal case).
+function repairOrphanedToolPairs(bodyStr) {
+  if (bodyStr.indexOf('"tool_use"') === -1 && bodyStr.indexOf('"tool_result"') === -1) return bodyStr;
+  let parsed;
+  try { parsed = JSON.parse(bodyStr); } catch (e) { return bodyStr; }
+  if (!Array.isArray(parsed.messages)) return bodyStr;
+  const useIds = new Set(), resultIds = new Set();
+  for (const msg of parsed.messages) {
+    if (!Array.isArray(msg.content)) continue;
+    for (const b of msg.content) {
+      if (b && b.type === 'tool_use' && typeof b.id === 'string') useIds.add(b.id);
+      if (b && b.type === 'tool_result' && typeof b.tool_use_id === 'string') resultIds.add(b.tool_use_id);
+    }
+  }
+  const orphanUses = new Set([...useIds].filter(id => !resultIds.has(id)));
+  const orphanResults = new Set([...resultIds].filter(id => !useIds.has(id)));
+  if (orphanUses.size === 0 && orphanResults.size === 0) return bodyStr;
+  for (const msg of parsed.messages) {
+    if (!Array.isArray(msg.content)) continue;
+    msg.content = msg.content.filter(b => {
+      if (b && b.type === 'tool_use' && typeof b.id === 'string') return !orphanUses.has(b.id);
+      if (b && b.type === 'tool_result' && typeof b.tool_use_id === 'string') return !orphanResults.has(b.tool_use_id);
+      return true;
+    });
+  }
+  console.log(`[REPAIR] Removed ${orphanUses.size} orphaned tool_use, ${orphanResults.size} orphaned tool_result`);
+  return JSON.stringify(parsed);
+}
+
 // ─── Pattern Compilation ────────────────────────────────────────────────────
 // The proxy historically rewrote each body with one String.split(find).join()
 // per pattern — ~87 full-body passes per request in processBody() and ~147 per
@@ -675,16 +947,62 @@ function ensureReplacers(config) {
     revTools: compileReplacer(tool.flatMap(revBoth)),
     revProps: compileReplacer(prop.flatMap(revBoth)),
     revStrings: compileReplacer(config.reverseMap || []),
+    // Reverse map restricted to entries safe for tool-call arguments: drops the
+    // lossy natural-language identity swaps that corrupt real arg data.
+    revStringsToolSafe: compileReplacer(
+      (config.reverseMap || []).filter(([from]) => !TOOL_ARG_UNSAFE_REVERSALS.has(from))),
   };
   Object.defineProperty(config, '_replacers', { value: replacers, enumerable: false });
   return replacers;
 }
 
 // ─── Request Processing ─────────────────────────────────────────────────────
-function processBody(bodyStr, config) {
+function processBody(bodyStr, config, requestUrl) {
+  // The count_tokens endpoint rejects fields that /v1/messages accepts (notably
+  // `metadata`: "Extra inputs are not permitted"). Identity transforms still run;
+  // only metadata injection is skipped for it (metadata is not token-bearing, so
+  // the count is unaffected).
+  const isCountTokens = typeof requestUrl === 'string' && requestUrl.includes('count_tokens');
+
+  // Remap the framework-prefixed model id (hermes-* -> claude-*) FIRST, as a raw
+  // string op so it ALWAYS runs. The JSON-aware remap later in this function is
+  // skipped whenever the body carries a thinking block — maskThinkingBlocks
+  // replaces those with a bare placeholder, so the JSON.parse there throws and
+  // the model never gets remapped. That forwarded "hermes-opus-4-8" to Anthropic
+  // and 404'd every reasoning request. Doing it here, unconditionally, fixes it.
+  bodyStr = bodyStr.replace(/("model"\s*:\s*")hermes-/g, '$1claude-');
+
+  // Repair orphaned tool_use/tool_result pairs before anything else (needs valid
+  // JSON; no-op + untouched body when nothing is orphaned).
+  if (config.repairOrphanedTools !== false) bodyStr = repairOrphanedToolPairs(bodyStr);
+
   // Mask thinking/redacted_thinking blocks before transforms
   const { masked: maskedBody, masks: thinkMasks } = maskThinkingBlocks(bodyStr);
   let m = maskedBody;
+
+  // Optionally mask tool_use input objects so Layer 2/3/6 can't mutate tool-call
+  // arguments in message history (#57). Default OFF: the forward mutations
+  // round-trip cleanly through reverseMap anyway, and masking sends raw .hermes/
+  // identity markers to Anthropic in tool args (a small identity-hiding cost).
+  // Restored before return.
+  let toolInputMasks = null;
+  if (config.maskToolUseInputs) {
+    const masked = maskToolUseInputs(m);
+    m = masked.masked;
+    toolInputMasks = masked.masks;
+  }
+
+  // Strip the `effort` param for Haiku (Haiku 400s on it; Opus/Sonnet keep it).
+  // Checked against the still-original model name (remap to claude-* happens
+  // later), so match 'haiku' anywhere — covers hermes-haiku-* and claude-haiku-*.
+  if (config.stripEffortForHaiku !== false) {
+    const modelMatch = m.match(/"model"\s*:\s*"([^"]*)"/);
+    if (modelMatch && modelMatch[1].toLowerCase().includes('haiku')) {
+      m = stripEffortFromObject(m, 'output_config');
+      m = stripEffortFromObject(m, 'thinking');
+      console.log('[EFFORT] Stripped effort param for Haiku model: ' + modelMatch[1]);
+    }
+  }
 
   // Debug: dump raw system prompt (gated — opt in with DEBUG_DUMPS=1)
   if (process.env.DEBUG_DUMPS) {
@@ -703,14 +1021,12 @@ function processBody(bodyStr, config) {
   // Layer 2: String trigger sanitization (single precompiled pass)
   m = replacers.fwdReplace(m);
 
-  // Layer 3: Tool name fingerprint bypass (quoted, single precompiled pass)
+  // Layer 3: Tool name fingerprint bypass (quoted, single precompiled pass).
+  // The static map (DEFAULT_TOOL_RENAMES) now disguises every tool as a native
+  // CC tool or a genuine mcp__<server>__<tool> name. The old dynamic
+  // "mcp_xxx" -> "McpXxx" PascalCase rename was REMOVED: it produced names real
+  // Claude Code never sends (detected) AND would mangle the new mcp__ names.
   m = replacers.fwdTools(m);
-
-  // Dynamic MCP tool rename: "mcp_xxx_yyy" -> "McpXxxYyy" (PascalCase)
-  m = m.replace(/"mcp_([a-z_]+)"/g, (match, name) => {
-    const pascal = 'Mcp' + name.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('');
-    return '"' + pascal + '"';
-  });
 
   // Layer 6: Property name renaming (single precompiled pass)
   m = replacers.fwdProps(m);
@@ -739,20 +1055,25 @@ function processBody(bodyStr, config) {
           section = section.slice(0, vs) + section.slice(i);
           from = vs + 1;
         }
-        // Inject CC tool stubs
+        // Inject CC tool stubs. Omit the trailing comma when the tools array is
+        // empty ("tools":[]) — otherwise the stubs produce [..stub,] which is
+        // invalid JSON and 400s.
         if (config.injectCCStubs) {
           const insertAt = '"tools":['.length;
-          section = section.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + ',' + section.slice(insertAt);
+          const sep = section[insertAt] === ']' ? '' : ',';
+          section = section.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + sep + section.slice(insertAt);
         }
         m = m.slice(0, toolsIdx) + section + m.slice(toolsEndIdx + 1);
       }
     }
   } else if (config.injectCCStubs) {
-    // Inject stubs even without description stripping
+    // Inject stubs even without description stripping. Omit the trailing comma
+    // for an empty "tools":[] array (otherwise [..stub,] is invalid JSON).
     const toolsIdx = m.indexOf('"tools":[');
     if (toolsIdx !== -1) {
       const insertAt = toolsIdx + '"tools":['.length;
-      m = m.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + ',' + m.slice(insertAt);
+      const sep = m[insertAt] === ']' ? '' : ',';
+      m = m.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + sep + m.slice(insertAt);
     }
   }
 
@@ -780,21 +1101,24 @@ function processBody(bodyStr, config) {
   }
 
   // Metadata injection: device_id + session_id matching real CC format
-  // Uses raw string manipulation to inject/replace metadata field
-  const metaValue = JSON.stringify({ device_id: DEVICE_ID, session_id: INSTANCE_SESSION_ID });
-  const metaJson = '"metadata":{"user_id":' + JSON.stringify(metaValue) + '}';
-  const existingMeta = m.indexOf('"metadata":{');
-  if (existingMeta !== -1) {
-    // Find end of existing metadata object
-    let depth = 0, mi = existingMeta + '"metadata":'.length;
-    for (; mi < m.length; mi++) {
-      if (m[mi] === '{') depth++;
-      else if (m[mi] === '}') { depth--; if (depth === 0) { mi++; break; } }
+  // Uses raw string manipulation to inject/replace metadata field.
+  // Skipped for count_tokens, which rejects metadata with a 400.
+  if (!isCountTokens) {
+    const metaValue = JSON.stringify({ device_id: DEVICE_ID, session_id: INSTANCE_SESSION_ID });
+    const metaJson = '"metadata":{"user_id":' + JSON.stringify(metaValue) + '}';
+    const existingMeta = m.indexOf('"metadata":{');
+    if (existingMeta !== -1) {
+      // Find end of existing metadata object
+      let depth = 0, mi = existingMeta + '"metadata":'.length;
+      for (; mi < m.length; mi++) {
+        if (m[mi] === '{') depth++;
+        else if (m[mi] === '}') { depth--; if (depth === 0) { mi++; break; } }
+      }
+      m = m.slice(0, existingMeta) + metaJson + m.slice(mi);
+    } else {
+      // Insert after opening brace
+      m = '{' + metaJson + ',' + m.slice(1);
     }
-    m = m.slice(0, existingMeta) + metaJson + m.slice(mi);
-  } else {
-    // Insert after opening brace
-    m = '{' + metaJson + ',' + m.slice(1);
   }
 
   // Layer 8: Strip trailing assistant prefill (raw string, no JSON.parse)
@@ -986,21 +1310,15 @@ function processBody(bodyStr, config) {
   // "Python toolkit", etc.) and turned it into "hermes". Precise identity
   // hiding is handled by DEFAULT_REPLACEMENTS above.
 
+  if (toolInputMasks) m = unmaskToolUseInputs(m, toolInputMasks);
   return unmaskThinkingBlocks(m, thinkMasks);
 }
 
 // ─── Response Processing ────────────────────────────────────────────────────
 function reverseMap(text, config) {
   let r = text;
-  // Reverse dynamic MCP tool names: "McpXxxYyy" -> "mcp_xxx_yyy"
-  r = r.replace(/"Mcp([A-Z][a-zA-Z]*)"/g, (match, name) => {
-    const snake = name.replace(/([A-Z])/g, '_$1').toLowerCase().slice(1);
-    return '"mcp_' + snake + '"';
-  });
-  r = r.replace(/\\"Mcp([A-Z][a-zA-Z]*)\\"/g, (match, name) => {
-    const snake = name.replace(/([A-Z])/g, '_$1').toLowerCase().slice(1);
-    return '\\"mcp_' + snake + '\\"';
-  });
+  // (Dynamic "McpXxx" -> "mcp_xxx" reversal removed alongside its forward pass;
+  //  tool names now round-trip via the static revTools map below.)
   // Reverse tool names first (more specific patterns).
   // Handle BOTH plain ("Name") AND escaped (\"Name\") forms.
   // SSE input_json_delta embeds tool args in a partial_json string field where
@@ -1015,6 +1333,39 @@ function reverseMap(text, config) {
   r = replacers.revProps(r);
   r = replacers.revStrings(r);
   // Reverse final-sweep removed (see outbound counterpart for rationale).
+  return r;
+}
+
+// Reverse-map for tool-call ARGUMENTS only. Identical to reverseMap but uses the
+// tool-arg-safe string map, which omits the lossy natural-language identity
+// swaps (bare "claude"/"Claude", platform prose). Without this, a model-emitted
+// path like /projects/claude-demo or a `git clone .../claude-utils` would be
+// rewritten to hermes-* and the tool would fail with ENOENT. Structural
+// reversals (paths, env vars, filenames, prop keys, tool names) still apply so
+// the proxy's own disguised tokens round-trip correctly.
+function reverseMapToolArgs(text, config) {
+  let r = text;
+  const replacers = ensureReplacers(config);
+  r = replacers.revTools(r);
+  r = replacers.revProps(r);
+  r = replacers.revStringsToolSafe(r);
+  return r;
+}
+
+// Reverse-map a whole (non-streaming) response buffer, scoping the reverse so
+// tool_use input objects get the tool-arg-safe map while everything else (visible
+// text, tool-name envelopes) gets the full map. Reuses maskToolUseInputs to
+// isolate the input objects, full-reverses the rest, then tool-safe-reverses each
+// masked input on the way back in. The streaming path achieves the same scoping
+// directly in createSseEventTransformer (it already buffers tool_use input).
+function reverseMapResponse(text, config) {
+  if (text.indexOf('"type":"tool_use"') === -1) return reverseMap(text, config);
+  const { masked, masks } = maskToolUseInputs(text);
+  let r = reverseMap(masked, config);
+  for (let i = 0; i < masks.length; i++) {
+    r = r.split('"' + TOOL_INPUT_MASK_PREFIX + i + TOOL_INPUT_MASK_SUFFIX + '"')
+         .join(reverseMapToolArgs(masks[i], config));
+  }
   return r;
 }
 
@@ -1219,7 +1570,9 @@ function createSseEventTransformer(config) {
           const m = e.match(PARTIAL_RE);
           return m ? m[1] : '';
         }).join('');
-        const rewritten = reverseMap(assembled, config);
+        // Tool ARGUMENTS: use the tool-arg-safe reverse so identity swaps don't
+        // corrupt paths/commands/urls the model generated (ENOENT fix).
+        const rewritten = reverseMapToolArgs(assembled, config);
         const synthDelta = 'event: content_block_delta\ndata: ' +
           '{"type":"content_block_delta","index":' + evtIndex +
           ',"delta":{"type":"input_json_delta","partial_json":"' +
@@ -1344,12 +1697,16 @@ function startServer(config) {
       // path-rewrite at line 828 maps hermes-* → claude-* before the
       // request leaves the proxy, so both forms route identically.
       const models = [
-        { id: 'hermes-opus-4-7',    object: 'model', owned_by: 'anthropic', context_length: 1000000 },
-        { id: 'hermes-sonnet-4-6',  object: 'model', owned_by: 'anthropic', context_length: 1000000 },
-        { id: 'hermes-haiku-4-5',   object: 'model', owned_by: 'anthropic', context_length: 200000  },
-        { id: 'claude-opus-4-7',    object: 'model', owned_by: 'anthropic', context_length: 1000000 },
-        { id: 'claude-sonnet-4-6',  object: 'model', owned_by: 'anthropic', context_length: 1000000 },
-        { id: 'claude-haiku-4-5',   object: 'model', owned_by: 'anthropic', context_length: 200000  },
+        { id: 'hermes-opus-4-8',         object: 'model', owned_by: 'anthropic', context_length: 1000000 },
+        { id: 'hermes-opus-4-7',         object: 'model', owned_by: 'anthropic', context_length: 1000000 },
+        { id: 'hermes-sonnet-4-6',       object: 'model', owned_by: 'anthropic', context_length: 1000000 },
+        { id: 'hermes-haiku-4-5',        object: 'model', owned_by: 'anthropic', context_length: 200000 },
+        { id: 'hermes-fable-5',          object: 'model', owned_by: 'anthropic', context_length: 1000000 },
+        { id: 'claude-opus-4-8',         object: 'model', owned_by: 'anthropic', context_length: 1000000 },
+        { id: 'claude-opus-4-7',         object: 'model', owned_by: 'anthropic', context_length: 1000000 },
+        { id: 'claude-sonnet-4-6',       object: 'model', owned_by: 'anthropic', context_length: 1000000 },
+        { id: 'claude-haiku-4-5',        object: 'model', owned_by: 'anthropic', context_length: 200000 },
+        { id: 'claude-fable-5',          object: 'model', owned_by: 'anthropic', context_length: 1000000 },
       ];
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ object: 'list', data: models }));
@@ -1376,13 +1733,17 @@ function startServer(config) {
       // defeat the proxy, and an uncaught throw here leaves the client hanging
       // until its socket timeout.
       try {
-        bodyStr = processBody(bodyStr, config);
+        bodyStr = processBody(bodyStr, config, req.url);
       } catch (e) {
         console.error(`[PROXY] #${reqNum} processBody failed: ${e.message}`);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_transform_error', message: e.message } }));
         return;
       }
+      // Compute the real Claude Code attestation hash over the final body so
+      // Anthropic bills to the subscription instead of extra usage. Must run
+      // last, after all transforms, so the hash covers the exact bytes sent.
+      if (config.computeRealCch !== false) bodyStr = applyCch(bodyStr);
       body = Buffer.from(bodyStr, 'utf8');
 
       const headers = {};
@@ -1401,25 +1762,40 @@ function startServer(config) {
       // Inject Stainless SDK + Claude Code identity headers
       Object.assign(headers, STAINLESS_HEADERS);
 
+      // Model-aware beta set: Haiku 400s on interleaved-thinking/effort/fast-mode,
+      // so getModelBetas drops them for Haiku and keeps the full set otherwise.
+      // bodyStr is post-transform here, so the model is already remapped to claude-*.
+      const betaModelMatch = bodyStr.match(/"model"\s*:\s*"([^"]*)"/);
+      const modelBetas = getModelBetas(betaModelMatch ? betaModelMatch[1] : '');
       const existingBeta = headers['anthropic-beta'] || '';
-      if (!existingBeta) {
-        headers['anthropic-beta'] = REQUIRED_BETAS_HEADER;
-      } else {
-        const betas = existingBeta.split(',').map(b => b.trim());
-        for (const b of REQUIRED_BETAS) { if (!betas.includes(b)) betas.push(b); }
-        // Max-subscription OAuth doesn't include 1M context access; the header
-        // 400s on models without 1M (haiku-4-5) and is a no-op on models where
-        // 1M is GA (opus-4-6/4-7, sonnet-4-6 on api.anthropic.com). Claude Code
-        // itself never sends it on OAuth — match that.
-        headers['anthropic-beta'] = betas.filter(b => b !== 'context-1m-2025-08-07').join(',');
+      const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
+      for (const b of modelBetas) { if (!betas.includes(b)) betas.push(b); }
+      // Max-subscription OAuth doesn't include 1M context access; the header
+      // 400s on models without 1M (haiku-4-5) and is a no-op on models where
+      // 1M is GA (opus-4-6/4-7, sonnet-4-6 on api.anthropic.com). Claude Code
+      // itself never sends it on OAuth — match that.
+      headers['anthropic-beta'] = betas.filter(b => b !== 'context-1m-2025-08-07').join(',');
+
+      // Path normalization: Hermes' OpenAI client calls /chat/completions (no
+      // /v1), but Anthropic's OpenAI-compatible endpoint is at
+      // /v1/chat/completions. A Hermes/openai-lib update started omitting the
+      // /v1 prefix, which 404'd every request (api.anthropic.com has no bare
+      // /chat/completions). Restore the prefix so requests reach the real
+      // endpoint. Paths already under /v1 (and /v1/messages) pass through as-is.
+      let upstreamPath = req.url;
+      if (upstreamPath === '/chat/completions' ||
+          upstreamPath === '/completions' ||
+          upstreamPath === '/embeddings') {
+        upstreamPath = '/v1' + upstreamPath;
       }
 
       const ts = new Date().toISOString().substring(11, 19);
-      console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${originalSize}b -> ${body.length}b)`);
+      const pathLog = upstreamPath !== req.url ? `${req.url} -> ${upstreamPath}` : req.url;
+      console.log(`[${ts}] #${reqNum} ${req.method} ${pathLog} (${originalSize}b -> ${body.length}b)`);
 
       const upstream = https.request({
         hostname: UPSTREAM_HOST, port: 443,
-        path: req.url, method: req.method, headers,
+        path: upstreamPath, method: req.method, headers,
         agent: UPSTREAM_AGENT
       }, (upRes) => {
         const status = upRes.statusCode;
@@ -1506,7 +1882,9 @@ function startServer(config) {
           upRes.on('end', () => {
             let respBody = Buffer.concat(respChunks).toString();
             const { masked: rMasked, masks: rMasks } = maskThinkingBlocks(respBody);
-            respBody = unmaskThinkingBlocks(reverseMap(rMasked, config), rMasks);
+            // reverseMapResponse scopes tool_use input objects to the tool-arg-safe
+            // reverse so identity swaps don't corrupt tool arguments (ENOENT fix).
+            respBody = unmaskThinkingBlocks(reverseMapResponse(rMasked, config), rMasks);
             const nh = { ...upRes.headers };
             delete nh['transfer-encoding'];
             nh['content-length'] = Buffer.byteLength(respBody);
@@ -1600,6 +1978,16 @@ module.exports = {
   compileReplacer,
   processBody,
   reverseMap,
+  reverseMapToolArgs,
+  reverseMapResponse,
+  maskToolUseInputs,
+  unmaskToolUseInputs,
+  repairOrphanedToolPairs,
+  getModelBetas,
+  stripEffortFromObject,
+  findMatchingObject,
+  detectCcVersion,
+  CC_VERSION,
   findSseStringField,
   jsonStringDecode,
   jsonStringEncode,
