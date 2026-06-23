@@ -65,9 +65,11 @@ test('reverseMap: property name reverts in plain and escaped forms', () => {
   assert.strictEqual(reverseMap('\\"thread_id\\"', CFG), '\\"session_id\\"');
 });
 
-test('reverseMap: dynamic Mcp* names revert to snake_case (plain + escaped)', () => {
-  assert.strictEqual(reverseMap('"McpFooBar"', CFG), '"mcp_foo_bar"');
-  assert.strictEqual(reverseMap('\\"McpFooBar\\"', CFG), '\\"mcp_foo_bar\\"');
+test('reverseMap: dynamic Mcp* PascalCase reversal is removed (passes through)', () => {
+  // The old "McpXxx" -> "mcp_xxx" dynamic rename was removed (it produced names
+  // real Claude Code never sends, and would mangle genuine mcp__ tool names).
+  // Unmapped Mcp* names now pass through untouched; tool disguise is static-only.
+  assert.strictEqual(reverseMap('"McpFooBar"', CFG), '"McpFooBar"');
 });
 
 test('reverseMap: longer string pattern wins over the bare catch-all', () => {
