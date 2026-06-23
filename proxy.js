@@ -1515,6 +1515,14 @@ function safeCut(buf, maxPatternLen, patterns) {
 //     could still grow into a pattern. Flush the held tail as one more
 //     synthesized text_delta at content_block_stop (or stream end via
 //     flushAll() if the stream truncates mid-block).
+// Keep the response `model` id as the real claude-* name. reverseMap's bare
+// claude->hermes branding flip would otherwise turn "model":"claude-opus-4-8"
+// into "hermes-opus-4-8" — inconsistent now that the picker is claude-only.
+// Conversational Hermes branding in text is untouched; only the model id field.
+function restoreModelId(s) {
+  return s.replace(/("model"\s*:\s*")hermes-/g, '$1claude-');
+}
+
 function createSseEventTransformer(config) {
   let maxReversePatternLen = 1;
   for (const [s] of config.reverseMap) {
@@ -1533,6 +1541,8 @@ function createSseEventTransformer(config) {
   const transform = (event) => {
     let dataIdx = event.startsWith('data: ') ? 0 : event.indexOf('\ndata: ');
     if (dataIdx === -1) return reverseMap(event, config);
+    // message_start carries the model id — keep it as the real claude-* name.
+    if (event.indexOf('"type":"message_start"') !== -1) return restoreModelId(reverseMap(event, config));
     if (dataIdx > 0) dataIdx += 1;
     const dataLineEnd = event.indexOf('\n', dataIdx + 6);
     const dataStr = dataLineEnd === -1
@@ -1696,12 +1706,11 @@ function startServer(config) {
       // regardless of which naming the config.yaml uses. The outbound
       // path-rewrite at line 828 maps hermes-* → claude-* before the
       // request leaves the proxy, so both forms route identically.
+      // Only the real Claude model ids are listed — these go straight to
+      // Anthropic with no model remap (cleaner, one less fingerprint). Legacy
+      // hermes-* references still work via the hermes-*->claude-* remap in
+      // processBody; they're just no longer offered in the picker.
       const models = [
-        { id: 'hermes-opus-4-8',         object: 'model', owned_by: 'anthropic', context_length: 1000000 },
-        { id: 'hermes-opus-4-7',         object: 'model', owned_by: 'anthropic', context_length: 1000000 },
-        { id: 'hermes-sonnet-4-6',       object: 'model', owned_by: 'anthropic', context_length: 1000000 },
-        { id: 'hermes-haiku-4-5',        object: 'model', owned_by: 'anthropic', context_length: 200000 },
-        { id: 'hermes-fable-5',          object: 'model', owned_by: 'anthropic', context_length: 1000000 },
         { id: 'claude-opus-4-8',         object: 'model', owned_by: 'anthropic', context_length: 1000000 },
         { id: 'claude-opus-4-7',         object: 'model', owned_by: 'anthropic', context_length: 1000000 },
         { id: 'claude-sonnet-4-6',       object: 'model', owned_by: 'anthropic', context_length: 1000000 },
@@ -1884,7 +1893,7 @@ function startServer(config) {
             const { masked: rMasked, masks: rMasks } = maskThinkingBlocks(respBody);
             // reverseMapResponse scopes tool_use input objects to the tool-arg-safe
             // reverse so identity swaps don't corrupt tool arguments (ENOENT fix).
-            respBody = unmaskThinkingBlocks(reverseMapResponse(rMasked, config), rMasks);
+            respBody = restoreModelId(unmaskThinkingBlocks(reverseMapResponse(rMasked, config), rMasks));
             const nh = { ...upRes.headers };
             delete nh['transfer-encoding'];
             nh['content-length'] = Buffer.byteLength(respBody);
