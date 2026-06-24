@@ -79,8 +79,11 @@ const BILLING_HASH_INDICES = [4, 7, 20];
 const DEVICE_ID = crypto.randomBytes(32).toString('hex');
 const INSTANCE_SESSION_ID = crypto.randomUUID();
 
-// Beta flags required for OAuth + Claude Code features
-const REQUIRED_BETAS = [
+// Beta flags real Claude Code sends. These are string literals embedded in the
+// installed CLI binary, so we auto-extract them to stay in lock-step with the
+// installed version instead of a hand-maintained list. Cached by binary mtime
+// (the binary is large); falls back to the curated list on any failure.
+const FALLBACK_BETAS = [
   'oauth-2025-04-20',
   'claude-code-20250219',
   'interleaved-thinking-2025-05-14',
@@ -90,6 +93,46 @@ const REQUIRED_BETAS = [
   'effort-2025-11-24',
   'fast-mode-2026-02-01'
 ];
+// Bounded to known beta families so we never grab arbitrary strings.
+const BETA_RE = /(?:oauth|claude-code|interleaved-thinking|advanced-tool-use|context-management|prompt-caching-scope|effort|fast-mode|context-1m)-20\d{2}(?:-\d{2}-\d{2}|\d{4})/g;
+
+function detectBetas(fallback) {
+  if (process.env.REQUIRED_BETAS) return process.env.REQUIRED_BETAS.split(',').map(s => s.trim()).filter(Boolean);
+  try {
+    const cp = require('child_process'), fs = require('fs'), path = require('path');
+    const cmd = process.platform === 'win32' ? 'where claude' : 'command -v claude';
+    const bin = cp.execSync(cmd, { timeout: 5000 }).toString().trim().split(/\r?\n/)[0];
+    if (!bin || !fs.existsSync(bin)) return fallback;
+    const st = fs.statSync(bin);
+    const cachePath = path.join(__dirname, '.betas_cache.json');
+    try {
+      const c = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+      if (c.mtimeMs === st.mtimeMs && Array.isArray(c.betas) && c.betas.length >= 3) return c.betas;
+    } catch (e) { /* no/stale cache — re-extract */ }
+    // Chunked scan (16MB) with overlap so a match can't straddle a boundary.
+    const fd = fs.openSync(bin, 'r');
+    const CH = 16 * 1024 * 1024, OV = 64;
+    const buf = Buffer.alloc(CH + OV);
+    let posn = 0, carry = '';
+    const found = new Set();
+    try {
+      while (true) {
+        const n = fs.readSync(fd, buf, OV, CH, posn);
+        if (n <= 0) break;
+        const s = carry + buf.toString('latin1', OV, OV + n);
+        (s.match(BETA_RE) || []).forEach(b => found.add(b));
+        carry = s.slice(-OV);
+        posn += n;
+      }
+    } finally { fs.closeSync(fd); }
+    // OAuth/subscription never carries the 1M-context beta (400s on most models).
+    const list = [...found].filter(b => b !== 'context-1m-2025-08-07');
+    if (list.length < 3) return fallback;
+    try { fs.writeFileSync(cachePath, JSON.stringify({ mtimeMs: st.mtimeMs, betas: list })); } catch (e) {}
+    return list;
+  } catch (e) { return fallback; }
+}
+const REQUIRED_BETAS = detectBetas(FALLBACK_BETAS);
 // Precomputed header value for the common case (no inbound anthropic-beta).
 // REQUIRED_BETAS never contains context-1m, so no filtering is needed here.
 const REQUIRED_BETAS_HEADER = REQUIRED_BETAS.join(',');
@@ -209,7 +252,13 @@ function buildBillingBlock(bodyStr) {
 // Seed observed via reverse-engineering of Claude Code 2.1.x. A self-test guards
 // against a wrong implementation: if xxHash64 fails its known vectors we leave
 // "cch=00000" untouched (degrade rather than send a corrupt attestation).
-const CCH_SEED = 0x6E52736AC806831En;
+// Version-specific xxHash64 seed for the cch attestation. It's a numeric constant
+// compiled into Claude Code's native layer (not a string), so it can't be
+// auto-extracted — but it has been stable across releases (2.1.37 -> 2.1.187).
+// If a future CLM update ever changes it, override here without editing code:
+//   set CCH_SEED=0x<newseed>   (the proxy's /health reports billing health so
+//   you'll know the moment it breaks). Accepts 0x-hex or decimal.
+const CCH_SEED = process.env.CCH_SEED ? BigInt(process.env.CCH_SEED) : 0x6E52736AC806831En;
 const _M64 = (1n << 64n) - 1n;
 const _XP1 = 0x9E3779B185EBCA87n, _XP2 = 0xC2B2AE3D27D4EB4Fn, _XP3 = 0x165667B19E3779F9n,
       _XP4 = 0x85EBCA77C2B2AE63n, _XP5 = 0x27D4EB2F165667C5n;
@@ -1667,6 +1716,10 @@ function applySseReverseMapChunks(chunks, config) {
 function startServer(config) {
   let requestCount = 0;
   const startedAt = Date.now();
+  // Billing health: track when Anthropic bills a request to extra usage (i.e. the
+  // cch/disguise is no longer recognized as genuine Claude Code). This is the
+  // proxy's one silent failure mode, so surface it on /health.
+  let extraUsageHits = 0, lastExtraUsageAt = null;
 
   const server = http.createServer((req, res) => {
     if (req.url === '/health' && req.method === 'GET') {
@@ -1680,6 +1733,11 @@ function startServer(config) {
           version: VERSION,
           requestsServed: requestCount,
           uptime: Math.floor((Date.now() - startedAt) / 1000) + 's',
+          // subscriptionBilling flips to "extra-usage" the moment cch is rejected.
+          subscriptionBilling: extraUsageHits === 0 ? 'ok' : 'extra-usage',
+          extraUsageHits,
+          lastExtraUsageAt,
+          ccVersion: CC_VERSION,
           tokenExpiresInHours: isFinite(expiresIn) ? expiresIn.toFixed(1) : 'n/a',
           subscriptionType: oauth.subscriptionType,
           layers: {
@@ -1837,7 +1895,9 @@ function startServer(config) {
           upRes.on('end', () => {
             let errBody = Buffer.concat(errChunks).toString();
             if (errBody.includes('extra usage')) {
-              console.error(`[${ts}] #${reqNum} DETECTION! Body: ${body.length}b`);
+              extraUsageHits++;
+              lastExtraUsageAt = new Date().toISOString();
+              console.error(`[${ts}] #${reqNum} ⚠️  BILLING FELL TO EXTRA USAGE (cch/disguise rejected; total=${extraUsageHits}). The cch seed may be stale for CC v${CC_VERSION} — override with CCH_SEED env. Body: ${body.length}b`);
               // Dump processed body for debugging (gated — opt in with DEBUG_DUMPS=1)
               if (process.env.DEBUG_DUMPS) {
                 const fs = require('fs');
