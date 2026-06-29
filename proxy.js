@@ -1722,6 +1722,14 @@ function startServer(config) {
   let extraUsageHits = 0, lastExtraUsageAt = null;
 
   const server = http.createServer((req, res) => {
+    // Strip the /anthropic routing prefix up front so EVERY route sees the real
+    // path: /health, the curated /v1/models (context-window discovery), and the
+    // proxied API path. Hermes appends /anthropic to base_url (README Gotcha #2);
+    // without normalizing here, /anthropic/v1/models misses the curated model list
+    // and gets forwarded to Anthropic's real endpoint, from which Hermes derives the
+    // wrong context window (1M -> 128k).
+    if (req.url === '/anthropic') req.url = '/';
+    else if (req.url.startsWith('/anthropic/')) req.url = req.url.slice('/anthropic'.length);
     if (req.url === '/health' && req.method === 'GET') {
       try {
         const oauth = getToken(config.credsPath);
@@ -1849,16 +1857,10 @@ function startServer(config) {
       // /v1 prefix, which 404'd every request (api.anthropic.com has no bare
       // /chat/completions). Restore the prefix so requests reach the real
       // endpoint. Paths already under /v1 (and /v1/messages) pass through as-is.
+      // The /anthropic routing prefix (Hermes appends it to base_url so
+      // provider:anthropic honors a non-anthropic.com base_url — README Gotcha #2)
+      // is already stripped from req.url at the top of the handler.
       let upstreamPath = req.url;
-      // /anthropic prefix strip: as of the June 2026 Hermes update, provider:anthropic
-      // only honors a non-anthropic.com model.base_url when its path ends in /anthropic
-      // (runtime_provider.py::_anthropic_base_url_override_ok / _detect_api_mode_for_url —
-      // the convention Anthropic-compatible proxies use). Without it Hermes silently
-      // falls back to https://api.anthropic.com and bypasses this proxy → extra usage.
-      // So config points at http://127.0.0.1:18802/anthropic; strip the suffix here to
-      // recover the real upstream path (/anthropic/v1/messages -> /v1/messages).
-      if (upstreamPath === '/anthropic') upstreamPath = '/';
-      else if (upstreamPath.startsWith('/anthropic/')) upstreamPath = upstreamPath.slice('/anthropic'.length);
       if (upstreamPath === '/chat/completions' ||
           upstreamPath === '/completions' ||
           upstreamPath === '/embeddings') {
