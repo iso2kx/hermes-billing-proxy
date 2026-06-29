@@ -32,7 +32,7 @@ The proxy performs bidirectional, byte-careful request/response surgery. Outboun
 Inbound (Anthropic → Hermes):
 
 14. **Full reverse mapping** — restores every tool name, property, and identity string in both **SSE streaming** and **JSON** responses. Thinking blocks pass through byte-identical; tool-call arguments use a "tool-arg-safe" reverse map so identity swaps don't corrupt model-generated paths/commands.
-15. **Path normalization** — `/chat/completions` → `/v1/chat/completions` for Hermes's OpenAI-mode client (no-op for `/v1/messages`).
+15. **Path normalization** — strips the `/anthropic` prefix Hermes adds to `base_url` (`/anthropic/v1/messages` → `/v1/messages`; see Gotcha #2), and maps `/chat/completions` → `/v1/chat/completions` for Hermes's OpenAI-mode client (no-op for a bare `/v1/messages`).
 
 CC version is auto-detected from `claude --version` (falls back to a pinned default), so the emulated identity tracks whatever Claude Code you actually have installed.
 
@@ -72,7 +72,7 @@ Point Hermes at the proxy in `config.yaml` (`%LOCALAPPDATA%\hermes\config.yaml` 
 model:
   provider: anthropic            # built-in provider; auto-selects anthropic_messages
   api_mode: anthropic_messages   # makes Hermes speak /v1/messages, not /chat/completions
-  base_url: http://127.0.0.1:18802
+  base_url: http://127.0.0.1:18802/anthropic   # /anthropic suffix is REQUIRED — see gotcha #2
   api_key: no-key-required       # allowlisted sentinel; the proxy supplies real OAuth
   default: claude-opus-4-8       # or claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5
 
@@ -90,7 +90,8 @@ Restart the gateway after any config change (`python hermes_cli/main.py gateway 
 ### Gotchas
 
 1. **`providers: { anthropic: {...} }` collides.** Defining a *custom* provider named `anthropic` makes Hermes rewrite the provider to `anthropic:anthropic` → **"Unknown provider"**. Keep `providers: {}` empty; the built-in `anthropic` provider already reads `model.base_url` and pulls real Claude Code OAuth from the credential pool.
-2. **Avoid `provider: custom`.** After recent Hermes updates it no longer honors `model.api_mode` (resolves to `chat_completions` → `/chat/completions` → 400 `tools.0.type` against the proxy's Anthropic stubs) **and** fails the credential check ("No usable credentials for custom") unless `api_key` is exactly the `no-key-required` sentinel. Prefer `provider: anthropic`.
+2. **The `/anthropic` suffix on `base_url` is mandatory (June 2026+).** Hermes' `_anthropic_base_url_override_ok()` silently **discards** a `provider: anthropic` `base_url` and falls back to `https://api.anthropic.com` — bypassing the proxy, so *everything* bills to extra usage — unless the host is `*.anthropic.com`/`*.claude.com`/`*.azure.com` **or the path ends in `/anthropic`**. So a loopback proxy URL must be `http://127.0.0.1:18802/anthropic`; the proxy strips that prefix before forwarding. Tell-tale: `/health` shows `requestsServed: 0` (no traffic reaches the proxy at all) even while billing falls to extra usage.
+3. **Avoid `provider: custom`.** After recent Hermes updates it no longer honors `model.api_mode` (resolves to `chat_completions` → `/chat/completions` → 400 `tools.0.type` against the proxy's Anthropic stubs) **and** fails the credential check ("No usable credentials for custom") unless `api_key` is exactly the `no-key-required` sentinel. Prefer `provider: anthropic`.
 3. **`anthropic` package must be installed** in the Hermes venv, or `anthropic_messages` mode won't load.
 4. **Control test:** the genuine `claude` CLI billing the same way is the baseline — if it bills to subscription and Hermes doesn't, the proxy disguise is the variable.
 

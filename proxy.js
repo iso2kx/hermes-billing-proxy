@@ -1850,6 +1850,15 @@ function startServer(config) {
       // /chat/completions). Restore the prefix so requests reach the real
       // endpoint. Paths already under /v1 (and /v1/messages) pass through as-is.
       let upstreamPath = req.url;
+      // /anthropic prefix strip: as of the June 2026 Hermes update, provider:anthropic
+      // only honors a non-anthropic.com model.base_url when its path ends in /anthropic
+      // (runtime_provider.py::_anthropic_base_url_override_ok / _detect_api_mode_for_url —
+      // the convention Anthropic-compatible proxies use). Without it Hermes silently
+      // falls back to https://api.anthropic.com and bypasses this proxy → extra usage.
+      // So config points at http://127.0.0.1:18802/anthropic; strip the suffix here to
+      // recover the real upstream path (/anthropic/v1/messages -> /v1/messages).
+      if (upstreamPath === '/anthropic') upstreamPath = '/';
+      else if (upstreamPath.startsWith('/anthropic/')) upstreamPath = upstreamPath.slice('/anthropic'.length);
       if (upstreamPath === '/chat/completions' ||
           upstreamPath === '/completions' ||
           upstreamPath === '/embeddings') {
