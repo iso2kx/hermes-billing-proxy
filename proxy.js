@@ -1779,6 +1779,7 @@ function startServer(config) {
       const models = [
         { id: 'claude-opus-4-8',         object: 'model', owned_by: 'anthropic', context_length: 1000000 },
         { id: 'claude-opus-4-7',         object: 'model', owned_by: 'anthropic', context_length: 1000000 },
+        { id: 'claude-sonnet-5',         object: 'model', owned_by: 'anthropic', context_length: 1000000 },
         { id: 'claude-sonnet-4-6',       object: 'model', owned_by: 'anthropic', context_length: 1000000 },
         { id: 'claude-haiku-4-5',        object: 'model', owned_by: 'anthropic', context_length: 200000 },
         { id: 'claude-fable-5',          object: 'model', owned_by: 'anthropic', context_length: 1000000 },
