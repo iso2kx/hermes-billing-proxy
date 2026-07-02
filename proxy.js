@@ -34,7 +34,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18802;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.2.3';
+const VERSION = '2.2.4';
 
 // Reuse a pool of TLS connections to Anthropic instead of opening a fresh
 // handshake per request. Cuts ~100ms off each call and prevents TIME_WAIT
@@ -61,7 +61,7 @@ function detectCcVersion(fallback) {
   } catch (e) { /* CLI unavailable — use the pinned fallback */ }
   return fallback;
 }
-const CC_VERSION = detectCcVersion('2.1.186');
+let CC_VERSION = detectCcVersion('2.1.186');
 
 // Token refresh defaults
 const DEFAULT_REFRESH_THRESHOLD_MINUTES = 2;
@@ -132,10 +132,71 @@ function detectBetas(fallback) {
     return list;
   } catch (e) { return fallback; }
 }
-const REQUIRED_BETAS = detectBetas(FALLBACK_BETAS);
+let REQUIRED_BETAS = detectBetas(FALLBACK_BETAS);
 // Precomputed header value for the common case (no inbound anthropic-beta).
 // REQUIRED_BETAS never contains context-1m, so no filtering is needed here.
-const REQUIRED_BETAS_HEADER = REQUIRED_BETAS.join(',');
+let REQUIRED_BETAS_HEADER = REQUIRED_BETAS.join(',');
+
+// ── Self-heal on Claude Code auto-update ───────────────────────────────────
+// CC_VERSION and REQUIRED_BETAS are detected once at startup. Claude Code
+// updates itself in place; when it does, the emulated version + beta set go
+// stale and Anthropic silently bills to *extra usage* until the proxy is
+// restarted. Re-detect them when the CLI changes so the proxy self-heals with
+// no restart and no external watchdog. Two triggers:
+//   1. proactive — a throttled binary-mtime check on the request path, and
+//   2. reactive  — an immediate re-check when a response falls to extra usage.
+// Both are no-ops when CC_VERSION is pinned via the env var.
+let _ccBinPath = null;
+let _ccBinMtimeMs = null;
+let _ccIdentityCheckedAt = 0;
+let _ccReactiveRefreshAt = 0;
+const CC_IDENTITY_STAT_INTERVAL_MS = 60000;
+
+function _findClaudeBinPath() {
+  const fs = require('fs');
+  if (_ccBinPath && fs.existsSync(_ccBinPath)) return _ccBinPath;
+  try {
+    const cmd = process.platform === 'win32' ? 'where claude' : 'command -v claude';
+    const bin = require('child_process').execSync(cmd, { timeout: 5000 })
+      .toString().trim().split(/\r?\n/)[0];
+    if (bin && fs.existsSync(bin)) { _ccBinPath = bin; return bin; }
+  } catch (e) { /* CLI not on PATH — keep the current pin */ }
+  return null;
+}
+
+// Re-detect version + betas from the installed CLI; swap them in if changed.
+function refreshCcIdentity(reason) {
+  if (process.env.CC_VERSION) return;
+  const newVersion = detectCcVersion(CC_VERSION);
+  const newBetas = detectBetas(REQUIRED_BETAS);
+  const newHeader = newBetas.join(',');
+  if (newVersion === CC_VERSION && newHeader === REQUIRED_BETAS_HEADER) return;
+  const oldVersion = CC_VERSION;
+  CC_VERSION = newVersion;
+  REQUIRED_BETAS = newBetas;
+  REQUIRED_BETAS_HEADER = newHeader;
+  console.log(`[${new Date().toISOString()}] 🔄 Re-synced Claude Code emulation (${reason}): v${oldVersion} -> v${CC_VERSION}, ${REQUIRED_BETAS.length} betas`);
+}
+
+// Proactive: if the CLI binary's mtime changed since we last looked, CC was
+// updated in place — re-sync. Throttled; the first sighting only records the
+// mtime (startup values are already current). A cheap stat per call; the
+// (heavier) re-detect runs only on an actual change.
+function maybeRefreshCcIdentity() {
+  if (process.env.CC_VERSION) return;
+  const now = Date.now();
+  if (now - _ccIdentityCheckedAt < CC_IDENTITY_STAT_INTERVAL_MS) return;
+  _ccIdentityCheckedAt = now;
+  try {
+    const bin = _findClaudeBinPath();
+    if (!bin) return;
+    const mtimeMs = require('fs').statSync(bin).mtimeMs;
+    if (_ccBinMtimeMs === null) { _ccBinMtimeMs = mtimeMs; return; }
+    if (mtimeMs === _ccBinMtimeMs) return;
+    _ccBinMtimeMs = mtimeMs;
+    refreshCcIdentity('CLI binary changed on disk');
+  } catch (e) { /* try again next interval */ }
+}
 
 // Model-aware beta selection. Several betas hard-400 on Haiku: it rejects
 // interleaved-thinking and effort, and fast-mode is Opus-only. Real Claude Code
@@ -1730,6 +1791,8 @@ function startServer(config) {
     // wrong context window (1M -> 128k).
     if (req.url === '/anthropic') req.url = '/';
     else if (req.url.startsWith('/anthropic/')) req.url = req.url.slice('/anthropic'.length);
+    // Self-heal if Claude Code updated under us (throttled binary-mtime check).
+    maybeRefreshCcIdentity();
     if (req.url === '/health' && req.method === 'GET') {
       try {
         const oauth = getToken(config.credsPath);
@@ -1910,6 +1973,13 @@ function startServer(config) {
               extraUsageHits++;
               lastExtraUsageAt = new Date().toISOString();
               console.error(`[${ts}] #${reqNum} ⚠️  BILLING FELL TO EXTRA USAGE (cch/disguise rejected; total=${extraUsageHits}). The cch seed may be stale for CC v${CC_VERSION} — override with CCH_SEED env. Body: ${body.length}b`);
+              // A stale emulated CC version is the usual cause (CC auto-updated).
+              // Re-check the installed CLI (throttled) so the NEXT request can
+              // recover without a manual restart — independent of the mtime watch.
+              if (Date.now() - _ccReactiveRefreshAt > 30000) {
+                _ccReactiveRefreshAt = Date.now();
+                refreshCcIdentity('extra-usage response — re-checking CLI version');
+              }
               // Dump processed body for debugging (gated — opt in with DEBUG_DUMPS=1)
               if (process.env.DEBUG_DUMPS) {
                 const fs = require('fs');

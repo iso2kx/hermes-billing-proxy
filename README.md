@@ -34,7 +34,7 @@ Inbound (Anthropic → Hermes):
 14. **Full reverse mapping** — restores every tool name, property, and identity string in both **SSE streaming** and **JSON** responses. Thinking blocks pass through byte-identical; tool-call arguments use a "tool-arg-safe" reverse map so identity swaps don't corrupt model-generated paths/commands.
 15. **Path normalization** — strips the `/anthropic` prefix Hermes adds to `base_url` (`/anthropic/v1/messages` → `/v1/messages`; see Gotcha #2), and maps `/chat/completions` → `/v1/chat/completions` for Hermes's OpenAI-mode client (no-op for a bare `/v1/messages`).
 
-CC version is auto-detected from `claude --version` (falls back to a pinned default), so the emulated identity tracks whatever Claude Code you actually have installed.
+CC version and beta set are auto-detected from the installed `claude` CLI (falls back to a pinned default), so the emulated identity tracks whatever Claude Code you actually have installed. The proxy also **re-detects them at runtime** when the CLI changes on disk — a throttled binary-mtime check on the request path, plus an immediate re-check whenever a response falls to extra usage — so it **self-heals after a Claude Code auto-update with no restart**. (Claude Code updates itself in place; a stale emulated version is the usual cause of a sudden "extra usage" flip.) Pin with the `CC_VERSION` env var to disable auto-detection.
 
 ---
 
@@ -164,7 +164,7 @@ When the OAuth token is within `refreshThresholdMinutes` of expiry, the proxy ru
 ```json
 {
   "status": "ok",
-  "version": "2.2.3",
+  "version": "2.2.4",
   "subscriptionBilling": "ok",        // flips to "extra-usage" if cch is rejected
   "extraUsageHits": 0,
   "lastExtraUsageAt": null,
@@ -222,7 +222,7 @@ Anthropic grants subscription billing only to traffic that looks like genuine Cl
 3. **Model id** — must be a real `claude-*` id; `hermes-*` 404s.
 4. **Billing header + fingerprint**, **Stainless/identity headers**, and **system-prompt template** matching round out the composite score.
 
-If billing falls to extra usage, `/health` flips `subscriptionBilling` to `extra-usage`, and the proxy logs a warning naming the likely cause (often a stale `cch` seed after a CC update — override with `CCH_SEED`). Run with `DEBUG_DUMPS=1` to capture the rejected body.
+If billing falls to extra usage, `/health` flips `subscriptionBilling` to `extra-usage`, and the proxy logs a warning naming the likely cause. The most common cause — a stale emulated CC version after Claude Code auto-updated in place — now **self-heals automatically**: the proxy re-detects the version/betas on the next request (mtime watch) or immediately on the extra-usage response itself, no restart needed. If it persists after re-detection, the `cch` seed itself may have changed for the new CC version — override with `CCH_SEED`. Run with `DEBUG_DUMPS=1` to capture the rejected body. (`extraUsageHits` is a per-process counter, so `/health` keeps showing `extra-usage` until the next proxy restart even after auto-recovery — check the logs for the `🔄 Re-synced` line to confirm recovery.)
 
 ---
 
