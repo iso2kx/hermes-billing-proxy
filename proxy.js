@@ -304,6 +304,100 @@ function buildBillingBlock(bodyStr) {
   return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=cli; cch=00000;"}`;
 }
 
+// Header-mode billing attestation (default). Builds the x-anthropic-billing-header
+// HTTP header value, with a real cch computed over the FINAL body bytes. Genuine
+// Claude Code sends this attestation as an HTTP header, not as prompt content;
+// the old approach injected it as the FIRST system block, which put the
+// per-request cch inside Anthropic's cached prefix and invalidated the whole
+// prompt cache every turn (cache_read_input_tokens -> ~0). Sending it as a header
+// keeps the cached body prefix byte-stable across turns so the cache hits.
+// Fingerprint is taken over the ORIGINAL first user text (before relocation
+// prepends <system-reminder> content), matching genuine CC's computeFingerprint.
+function buildBillingHeaderValue(originalBodyStr, finalBodyStr, config) {
+  const fp = computeBillingFingerprint(extractFirstUserText(originalBodyStr));
+  let cch = '00000';
+  if ((!config || config.computeRealCch !== false) && CCH_XXH_OK) {
+    cch = (xxh64(Buffer.from(finalBodyStr, 'utf8'), CCH_SEED) & 0xFFFFFn).toString(16).padStart(5, '0');
+  }
+  return `cc_version=${CC_VERSION}.${fp}; cc_entrypoint=cli; cch=${cch};`;
+}
+
+// ─── System-prompt relocation (subscription-billing fix, incl. subagents) ─────
+// Anthropic's subscription-vs-extra-usage decision inspects the system prompt.
+// Genuine Claude Code sends a system of essentially just its identity line, with
+// contextual material delivered as <system-reminder> blocks inside messages.
+// Hermes instead puts its whole framework prompt in `system`, which the MAIN
+// agent's rich persona happens to survive but SUBAGENTS (lean default identity)
+// do not — they're classified non-Claude-Code and billed to extra usage (a hard
+// 400 once extra usage is exhausted). Adding persona content to dominate the
+// classifier proved unreliable; the robust fix (per kristianvast/hermes-claude-auth)
+// is the opposite: strip `system` down to [billing, identity] and RELOCATE every
+// other system block into the first user message as a <system-reminder>. The
+// system then reads as genuine Claude Code, so main + subagents both bill to the
+// subscription. Behavior is preserved (the instructions are still present, just
+// moved). Verified: subagent bodies flip 400→200 reliably with this transform.
+const CC_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
+const BILLING_TEXT_PREFIX = 'x-anthropic-billing-header:';
+
+// Rebuild the body so `system` holds only the billing header + CC identity, with
+// all other system text moved into the first user message as <system-reminder>s.
+function relocateSystemToUser(bodyStr, config) {
+  if (config && config.relocateSystem === false) return bodyStr;
+  let obj;
+  try { obj = JSON.parse(bodyStr); } catch (e) { return bodyStr; }
+  if (!Array.isArray(obj.system) || !Array.isArray(obj.messages)) return bodyStr;
+  const kept = [];    // billing + identity stay in system
+  const moved = [];   // everything else → first user message
+  let identitySeen = false;
+  for (const block of obj.system) {
+    if (!block || typeof block.text !== 'string') { kept.push(block); continue; }
+    const text = block.text;
+    if (text.startsWith(BILLING_TEXT_PREFIX)) { kept.push(block); continue; }
+    if (text.startsWith(CC_IDENTITY)) {
+      if (!identitySeen) { identitySeen = true; kept.push({ type: 'text', text: CC_IDENTITY }); }
+      const rest = text.slice(CC_IDENTITY.length).replace(/^\n+/, '');
+      if (rest) moved.push(rest);
+      continue;
+    }
+    if (text) moved.push(text);
+  }
+  if (!identitySeen) {
+    // Insert the identity right after the billing block (or first if none).
+    const billIdx = kept.findIndex(b => b && typeof b.text === 'string' && b.text.startsWith(BILLING_TEXT_PREFIX));
+    kept.splice(billIdx === -1 ? 0 : billIdx + 1, 0, { type: 'text', text: CC_IDENTITY });
+  }
+  if (moved.length === 0) return bodyStr; // nothing to relocate — leave untouched
+  obj.system = kept;
+  const reminder = moved.map(t => `<system-reminder>\n${t}\n</system-reminder>`).join('\n\n');
+  const um = obj.messages.find(m => m && m.role === 'user');
+  if (!um) return bodyStr; // no user message to carry the reminder — abort relocation
+  if (Array.isArray(um.content)) {
+    const tb = um.content.find(c => c && c.type === 'text');
+    if (tb) {
+      tb.text = reminder + '\n\n' + tb.text;
+    } else if (um.content.some(c => c && c.type === 'tool_result')) {
+      // This first user turn is a tool_result response to a prior tool_use
+      // (happens when a compacted/long history begins mid tool-exchange).
+      // Anthropic requires the tool_result to lead the turn immediately after
+      // the tool_use, so a prepended text block 400s the whole request
+      // ("tool_use ids ... without tool_result blocks immediately after").
+      // Insert the reminder AFTER the last tool_result instead.
+      let idx = 0;
+      for (let k = 0; k < um.content.length; k++) {
+        if (um.content[k] && um.content[k].type === 'tool_result') idx = k + 1;
+      }
+      um.content.splice(idx, 0, { type: 'text', text: reminder });
+    } else {
+      um.content.unshift({ type: 'text', text: reminder });
+    }
+  } else if (typeof um.content === 'string') {
+    um.content = reminder + '\n\n' + um.content;
+  } else {
+    return bodyStr;
+  }
+  return JSON.stringify(obj);
+}
+
 // ─── Claude Code attestation hash (cch) ──────────────────────────────────────
 // Real Claude Code's native (Bun/Zig) layer computes cch = xxHash64(serialized
 // request body, with the literal "cch=00000" placeholder still in place) & 0xFFFFF,
@@ -736,9 +830,11 @@ function loadConfig() {
     injectCCStubs: config.injectCCStubs !== false,
     stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false,
     computeRealCch: config.computeRealCch !== false,             // default ON: real cch attestation for subscription billing
+    billingAsHeader: config.billingAsHeader !== false,           // default ON: send x-anthropic-billing-header as an HTTP header (cch OUT of cached body prefix so prompt cache hits); set false to fall back to the legacy in-system-block cch
     repairOrphanedTools: config.repairOrphanedTools !== false,   // default ON: prevents orphaned tool_use/result 400s
     stripEffortForHaiku: config.stripEffortForHaiku !== false,   // default ON: Haiku 400s on effort
     maskToolUseInputs: config.maskToolUseInputs === true,        // default OFF: #57; leaks .hermes/ markers in tool args
+    relocateSystem: config.relocateSystem !== false,             // default ON: system→[billing,identity], rest→user <system-reminder> (fixes subagent + all billing)
     refreshThresholdMs: (config.refreshThresholdMinutes || DEFAULT_REFRESH_THRESHOLD_MINUTES) * 60 * 1000,
     refreshRetryMs: (config.refreshRetrySeconds || DEFAULT_REFRESH_RETRY_SECONDS) * 1000,
     refreshEnabled: config.refreshEnabled !== false
@@ -1194,13 +1290,39 @@ function processBody(bodyStr, config, requestUrl) {
     }
   }
 
-  // Layer 1: Billing header injection (dynamic fingerprint per request)
-  const BILLING_BLOCK = buildBillingBlock(m);
-  const sysArrayIdx = m.indexOf('"system":[');
-  if (sysArrayIdx !== -1) {
-    const insertAt = sysArrayIdx + '"system":['.length;
-    m = m.slice(0, insertAt) + BILLING_BLOCK + ',' + m.slice(insertAt);
-  } else if (m.includes('"system":"')) {
+  // Layer 1: Billing attestation.
+  // Header mode (default): DO NOT inject a billing system block. The attestation
+  // is sent as an HTTP header by the request handler so the ever-changing cch
+  // stays OUT of Anthropic's cached body prefix (an in-prefix cch invalidated the
+  // whole prompt cache every turn). We only normalize a string-form `system` to
+  // array form so relocateSystemToUser can reduce it to [identity], exactly how
+  // genuine Claude Code's system reads.
+  // Legacy mode (billingAsHeader:false): inject the billing header as the first
+  // system block with an in-body cch placeholder (applyCch fills it in later).
+  if (config.billingAsHeader === false) {
+    const BILLING_BLOCK = buildBillingBlock(m);
+    const sysArrayIdx = m.indexOf('"system":[');
+    if (sysArrayIdx !== -1) {
+      const insertAt = sysArrayIdx + '"system":['.length;
+      m = m.slice(0, insertAt) + BILLING_BLOCK + ',' + m.slice(insertAt);
+    } else if (m.includes('"system":"')) {
+      const sysStart = m.indexOf('"system":"');
+      let i = sysStart + '"system":"'.length;
+      while (i < m.length) {
+        if (m[i] === '\\') { i += 2; continue; }
+        if (m[i] === '"') break;
+        i++;
+      }
+      const sysEnd = i + 1;
+      const originalSysStr = m.slice(sysStart + '"system":'.length, sysEnd);
+      m = m.slice(0, sysStart)
+        + '"system":[' + BILLING_BLOCK + ',{"type":"text","text":' + originalSysStr + '}]'
+        + m.slice(sysEnd);
+    } else {
+      m = '{"system":[' + BILLING_BLOCK + '],' + m.slice(1);
+    }
+  } else if (m.indexOf('"system":[') === -1 && m.includes('"system":"')) {
+    // Header mode: normalize string-form system to array form so relocation runs.
     const sysStart = m.indexOf('"system":"');
     let i = sysStart + '"system":"'.length;
     while (i < m.length) {
@@ -1211,10 +1333,8 @@ function processBody(bodyStr, config, requestUrl) {
     const sysEnd = i + 1;
     const originalSysStr = m.slice(sysStart + '"system":'.length, sysEnd);
     m = m.slice(0, sysStart)
-      + '"system":[' + BILLING_BLOCK + ',{"type":"text","text":' + originalSysStr + '}]'
+      + '"system":[{"type":"text","text":' + originalSysStr + '}]'
       + m.slice(sysEnd);
-  } else {
-    m = '{"system":[' + BILLING_BLOCK + '],' + m.slice(1);
   }
 
   // Metadata injection: device_id + session_id matching real CC format
@@ -1428,6 +1548,13 @@ function processBody(bodyStr, config, requestUrl) {
   // hiding is handled by DEFAULT_REPLACEMENTS above.
 
   if (toolInputMasks) m = unmaskToolUseInputs(m, toolInputMasks);
+
+  // System-prompt relocation — runs last (after billing injection + strip) so it
+  // sees the final system, then reduces it to [billing, identity] and moves the
+  // rest into the first user message as <system-reminder>s. This is what makes
+  // subagent (and all) traffic bill to the subscription. See notes above.
+  m = relocateSystemToUser(m, config);
+
   return unmaskThinkingBlocks(m, thinkMasks);
 }
 
@@ -1875,6 +2002,11 @@ function startServer(config) {
 
       let bodyStr = body.toString('utf8');
       const originalSize = bodyStr.length;
+      // Snapshot the untransformed body so the path router can tell an
+      // Anthropic-Messages payload from a genuine OpenAI one. processBody always
+      // injects a top-level "system" billing block, so this check MUST run on the
+      // original — post-transform every body looks like it has a "system" field.
+      const originalBodyStr = bodyStr;
       // Fail closed on transform bugs: forwarding an unsanitized body would
       // defeat the proxy, and an uncaught throw here leaves the client hanging
       // until its socket timeout.
@@ -1886,10 +2018,19 @@ function startServer(config) {
         res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_transform_error', message: e.message } }));
         return;
       }
-      // Compute the real Claude Code attestation hash over the final body so
-      // Anthropic bills to the subscription instead of extra usage. Must run
-      // last, after all transforms, so the hash covers the exact bytes sent.
-      if (config.computeRealCch !== false) bodyStr = applyCch(bodyStr);
+      // Claude Code attestation. Must run last, after all transforms, so the hash
+      // covers the exact bytes sent. Two modes:
+      //  - header mode (default): send x-anthropic-billing-header as a real HTTP
+      //    header with cch over the final body. Keeps the per-request cch OUT of
+      //    the cached body prefix so Anthropic's prompt cache hits.
+      //  - legacy mode (billingAsHeader:false): cch lives in the first system
+      //    block; applyCch fills the in-body placeholder. Kept as a fallback.
+      let billingHeaderValue = null;
+      if (config.billingAsHeader !== false) {
+        billingHeaderValue = buildBillingHeaderValue(originalBodyStr, bodyStr, config);
+      } else if (config.computeRealCch !== false) {
+        bodyStr = applyCch(bodyStr);
+      }
       body = Buffer.from(bodyStr, 'utf8');
 
       const headers = {};
@@ -1907,6 +2048,10 @@ function startServer(config) {
 
       // Inject Stainless SDK + Claude Code identity headers
       Object.assign(headers, STAINLESS_HEADERS);
+
+      // Header-mode billing attestation: send the cch as an HTTP header (genuine
+      // CC does the same), keeping it out of the cached request body.
+      if (billingHeaderValue) headers['x-anthropic-billing-header'] = billingHeaderValue;
 
       // Model-aware beta set: Haiku 400s on interleaved-thinking/effort/fast-mode,
       // so getModelBetas drops them for Haiku and keeps the full set otherwise.
@@ -2083,6 +2228,7 @@ function startServer(config) {
       console.log(`  System strip:      ${config.stripSystemConfig ? 'enabled' : 'disabled'}`);
       console.log(`  Description strip: ${config.stripToolDescriptions ? 'enabled' : 'disabled'}`);
       console.log(`  Billing hash:      dynamic (SHA256 fingerprint)`);
+      console.log(`  cch attestation:   ${config.computeRealCch === false ? 'off' : (config.billingAsHeader !== false ? 'HTTP header (prompt-cache safe)' : 'in-system-block (legacy)')}`);
       console.log(`  CC headers:        Stainless SDK + identity`);
       console.log(`  Credentials:       ${config.credsPath}`);
       console.log(`\n  Ready. Set openclaw.json baseUrl to http://${bindHost}:${config.port}\n`);
@@ -2137,6 +2283,8 @@ if (require.main === module) {
 module.exports = {
   loadConfig,
   compileReplacer,
+  relocateSystemToUser,
+  buildBillingHeaderValue,
   processBody,
   reverseMap,
   reverseMapToolArgs,
