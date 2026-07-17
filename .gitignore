@@ -4,3 +4,6 @@ config.json
 node_modules/
 .env
 .betas_cache.json
+proxy-stdout.log
+proxy-stderr.log
+.claude/
