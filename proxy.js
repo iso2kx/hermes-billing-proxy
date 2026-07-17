@@ -1907,6 +1907,24 @@ function applySseReverseMapChunks(chunks, config) {
   return out;
 }
 
+// Decide whether a /chat/completions body is really an Anthropic Messages
+// payload (Hermes' delegation path emits these) vs a genuine OpenAI one.
+// Conservative: only returns true on clear Anthropic markers, so real OpenAI
+// traffic still routes to /v1/chat/completions. Runs on the PRE-transform body
+// (post-transform every body carries an injected top-level "system" block).
+function looksLikeAnthropicMessages(s) {
+  // Definitive OpenAI markers — bail out immediately.
+  if (/"role"\s*:\s*"system"/.test(s)) return false;        // OpenAI keeps system as a message
+  if (/"max_completion_tokens"\s*:/.test(s)) return false;  // OpenAI-only field
+  if (/"messages"/.test(s) === false) return false;         // not a chat body at all
+  // Anthropic-positive markers.
+  if (/"type"\s*:\s*"(tool_use|tool_result|thinking|redacted_thinking)"/.test(s)) return true;
+  if (/"system"\s*:/.test(s)) return true;                  // top-level system field
+  if (/"anthropic_version"\s*:/.test(s)) return true;
+  if (/"content"\s*:\s*\[\s*\{\s*"type"\s*:\s*"text"/.test(s)) return true; // content-block array
+  return false;
+}
+
 // ─── Server ─────────────────────────────────────────────────────────────────
 function startServer(config) {
   let requestCount = 0;
@@ -2080,7 +2098,20 @@ function startServer(config) {
       if (upstreamPath === '/chat/completions' ||
           upstreamPath === '/completions' ||
           upstreamPath === '/embeddings') {
-        upstreamPath = '/v1' + upstreamPath;
+        // Subscription billing (cch/disguise) is ONLY honored on the native
+        // Messages API (/v1/messages). Anthropic's OpenAI-compat endpoint
+        // (/v1/chat/completions) always bills to metered/extra-usage. Hermes'
+        // delegation/subagent path ships Anthropic-format bodies to
+        // /chat/completions (api_mode unset -> OpenAI default), which silently
+        // fell to extra usage. When the body is actually Anthropic Messages
+        // format, route it to /v1/messages so it bills to the subscription like
+        // the main agent; genuine OpenAI bodies still go to /v1/chat/completions.
+        if ((upstreamPath === '/chat/completions' || upstreamPath === '/completions') &&
+            looksLikeAnthropicMessages(originalBodyStr)) {
+          upstreamPath = '/v1/messages';
+        } else {
+          upstreamPath = '/v1' + upstreamPath;
+        }
       }
 
       const ts = new Date().toISOString().substring(11, 19);
@@ -2283,6 +2314,7 @@ if (require.main === module) {
 module.exports = {
   loadConfig,
   compileReplacer,
+  looksLikeAnthropicMessages,
   relocateSystemToUser,
   buildBillingHeaderValue,
   processBody,
