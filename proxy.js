@@ -787,9 +787,16 @@ function refreshCredentials(credsPath) {
   const { execSync } = require('child_process');
   let claudeBin = 'claude';
   try {
-    claudeBin = execSync('which claude', { encoding: 'utf8', timeout: 5000, stdio: 'pipe' }).trim() || 'claude';
+    // On Windows execSync goes through cmd.exe, and Git Bash's which.exe answers
+    // with a POSIX path (/c/Users/...) that cmd.exe cannot execute — use where.
+    const lookup = process.platform === 'win32' ? 'where claude' : 'which claude';
+    claudeBin = execSync(lookup, { encoding: 'utf8', timeout: 5000, stdio: 'pipe' })
+      .split(/\r?\n/)[0].trim() || 'claude';
   } catch(e) {
-    const candidates = [
+    const candidates = process.platform === 'win32' ? [
+      path.join(os.homedir(), '.local', 'bin', 'claude.exe'),
+      path.join(os.homedir(), 'AppData', 'Roaming', 'npm', 'claude.cmd')
+    ] : [
       path.join(os.homedir(), '.local', 'bin', 'claude'),
       path.join(os.homedir(), '.npm-global', 'bin', 'claude'),
       '/usr/local/bin/claude', '/usr/bin/claude'
@@ -799,7 +806,7 @@ function refreshCredentials(credsPath) {
     }
   }
   try {
-    execSync(claudeBin + ' -p "ping" --max-turns 1 --no-session-persistence', {
+    execSync('"' + claudeBin + '" -p "ping" --max-turns 1 --no-session-persistence', {
       timeout: CLAUDE_CLI_REFRESH_TIMEOUT_MS, stdio: 'pipe'
     });
   } catch(e) {
@@ -2097,7 +2104,10 @@ function startServer(config) {
           if (result === 'retry') {
             consecutiveFailures++;
             if (consecutiveFailures >= MAX_CONSECUTIVE_REFRESH_FAILURES) {
-              console.error('[PROXY] Token refresh failed ' + consecutiveFailures + ' times, giving up.');
+              // Never stop retrying entirely: a dead refresh loop means every request
+              // 401s once the token expires, until someone restarts the proxy.
+              console.error('[PROXY] Token refresh failed ' + consecutiveFailures + ' times, retrying every ' + (MAX_REFRESH_RETRY_MS / 60000) + 'm.');
+              scheduleNext(MAX_REFRESH_RETRY_MS);
               return;
             }
             const backoff = Math.min(config.refreshRetryMs * Math.pow(2, consecutiveFailures - 1), MAX_REFRESH_RETRY_MS);
