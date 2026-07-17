@@ -1172,6 +1172,81 @@ function ensureReplacers(config) {
   return replacers;
 }
 
+// ─── Generic MCP tool disguise (self-healing fallback) ──────────────────────
+// The static DEFAULT_TOOL_RENAMES map covers the MCP servers we know about, but
+// it's hand-maintained: enable a NEW MCP server in Hermes and its tools arrive
+// as bare single-underscore `mcp_<server>_<tool>` names the map never learned.
+// Those read as foreign to Anthropic's tool-set fingerprint → the request bills
+// to extra usage instead of the subscription (root cause of the 2026-07-17
+// coingecko incident). This fallback runs AFTER the static map and rewrites any
+// SURVIVING single-underscore `mcp_*` name to the canonical
+// `mcp__<server>__<tool>` shape, so any future MCP server just works with no
+// proxy edit. Deterministic and losslessly reversible: Hermes tool names never
+// contain "__", so the reverse (below) simply collapses "__" back to "_".
+//
+// The split is on the FIRST underscore (server = first segment, tool = rest).
+// It need not be semantically perfect — Anthropic keys on the mcp__A__B SHAPE,
+// not on a correct server/tool boundary — only deterministic and reversible.
+// The pattern requires a server/tool boundary (`mcp_<server>_<tool>`, ≥2
+// segments), which is the only shape Hermes actually emits; a degenerate
+// single-segment `mcp_<x>` (no real server) is left alone and surfaced by
+// warnOnForeignTools instead of being mangled into an un-reversible form.
+// Matches quoted JSON tokens (tool defs AND assistant tool_use names in history,
+// which must agree), consistent with how the static fwdTools pass operates.
+const _UNMAPPED_MCP_RE = /"mcp_(?!_)([A-Za-z0-9]+)_([A-Za-z0-9_]+)"/g;
+
+function disguiseUnmappedMcpTools(body) {
+  const found = [];
+  const out = body.replace(_UNMAPPED_MCP_RE, (full, server, tool) => {
+    found.push(`mcp_${server}_${tool}`);
+    return `"mcp__${server}__${tool}"`;
+  });
+  return { body: out, found };
+}
+
+// Reverse of disguiseUnmappedMcpTools: collapse any leftover canonical
+// `mcp__server__tool` back to Hermes's `mcp_server_tool`. Runs AFTER the static
+// revTools pass, which has already turned every statically-mapped name back into
+// its real Hermes name (leaving no "__"), so this only touches the generically
+// disguised long-tail. Handles plain ("…") and SSE-escaped (\"…\") forms.
+function reverseUnmappedMcpTools(text) {
+  return text
+    .replace(/"mcp__([A-Za-z0-9_]+?)"/g, (full, rest) => `"mcp_${rest.replace(/__/g, '_')}"`)
+    .replace(/\\"mcp__([A-Za-z0-9_]+?)\\"/g, (full, rest) => `\\"mcp_${rest.replace(/__/g, '_')}\\"`);
+}
+
+// ─── Foreign-tool warning (observability) ───────────────────────────────────
+// Belt-and-suspenders for the disguise: after all forward renames, scan the
+// `tools` array for any name that still doesn't look like genuine Claude Code —
+// i.e. not a native CC tool (PascalCase) and not an `mcp__server__tool`. Such a
+// name will trip Anthropic's fingerprint and silently bill to extra usage. We
+// warn ONCE per distinct name (deduped for the proxy's lifetime) so a newly
+// added tool surfaces in the log the moment it appears, instead of as a mystery
+// extra-usage charge weeks later. Generic mcp_ names are auto-fixed above; this
+// still fires for a brand-new NON-mcp core tool the static map hasn't learned.
+const _warnedForeignTools = new Set();
+
+function warnOnForeignTools(bodyStr) {
+  const toolsIdx = bodyStr.indexOf('"tools":[');
+  if (toolsIdx === -1) return;
+  const end = findMatchingBracket(bodyStr, toolsIdx + '"tools":'.length);
+  if (end === -1) return;
+  const section = bodyStr.slice(toolsIdx, end + 1);
+  const nameRe = /"name":"([^"]+)"/g;
+  let m;
+  const foreign = [];
+  while ((m = nameRe.exec(section)) !== null) {
+    const name = m[1];
+    if (/^mcp__/.test(name) || /^[A-Z]/.test(name)) continue; // mcp__x__y or PascalCase native
+    if (_warnedForeignTools.has(name)) continue;
+    _warnedForeignTools.add(name);
+    foreign.push(name);
+  }
+  if (foreign.length) {
+    console.error(`[${new Date().toISOString()}] ⚠️  FOREIGN TOOL NAME(S) in request — will read as non-Claude-Code and risk extra-usage billing: ${foreign.join(', ')}. Add them to DEFAULT_TOOL_RENAMES (mcp_ names are auto-disguised; other names are NOT).`);
+  }
+}
+
 // ─── Request Processing ─────────────────────────────────────────────────────
 function processBody(bodyStr, config, requestUrl) {
   // The count_tokens endpoint rejects fields that /v1/messages accepts (notably
@@ -1243,6 +1318,16 @@ function processBody(bodyStr, config, requestUrl) {
   // "mcp_xxx" -> "McpXxx" PascalCase rename was REMOVED: it produced names real
   // Claude Code never sends (detected) AND would mangle the new mcp__ names.
   m = replacers.fwdTools(m);
+
+  // Layer 3b: Generic MCP fallback. Any single-underscore `mcp_*` tool the
+  // static map didn't cover (a newly enabled MCP server) still reads as foreign;
+  // rewrite it to the canonical `mcp__server__tool` shape so it bills to the
+  // subscription with no manual DEFAULT_TOOL_RENAMES entry. Self-healing.
+  m = disguiseUnmappedMcpTools(m).body;
+
+  // Observability: warn (once per name) about any tool that STILL looks foreign
+  // after both rename passes — e.g. a brand-new non-mcp core tool.
+  warnOnForeignTools(m);
 
   // Layer 6: Property name renaming (single precompiled pass)
   m = replacers.fwdProps(m);
@@ -1577,6 +1662,7 @@ function reverseMap(text, config) {
   // (\"Name\") forms in one regex.
   const replacers = ensureReplacers(config);
   r = replacers.revTools(r);
+  r = reverseUnmappedMcpTools(r); // collapse generically-disguised mcp__x__y -> mcp_x_y
   r = replacers.revProps(r);
   r = replacers.revStrings(r);
   // Reverse final-sweep removed (see outbound counterpart for rationale).
@@ -1594,6 +1680,7 @@ function reverseMapToolArgs(text, config) {
   let r = text;
   const replacers = ensureReplacers(config);
   r = replacers.revTools(r);
+  r = reverseUnmappedMcpTools(r); // collapse generically-disguised mcp__x__y -> mcp_x_y
   r = replacers.revProps(r);
   r = replacers.revStringsToolSafe(r);
   return r;
@@ -2317,6 +2404,8 @@ if (require.main === module) {
 module.exports = {
   loadConfig,
   compileReplacer,
+  disguiseUnmappedMcpTools,
+  reverseUnmappedMcpTools,
   looksLikeAnthropicMessages,
   relocateSystemToUser,
   buildBillingHeaderValue,
