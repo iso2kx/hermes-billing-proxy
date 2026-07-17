@@ -118,9 +118,34 @@ test('processBody: no-marker body skips the JSON pass but still injects billing 
   });
   const out = processBody(body, PB);
   const parsed = JSON.parse(out); // skip path must still emit valid JSON
-  assert.ok(out.includes('x-anthropic-billing-header'), 'billing block not injected');
+  // Header mode (default): the billing attestation is sent as an HTTP header by
+  // the request handler, NOT injected into the body — this keeps the per-request
+  // cch out of Anthropic's cached prefix so the prompt cache hits.
+  assert.ok(!out.includes('x-anthropic-billing-header'), 'billing block must NOT be in the body in header mode');
   assert.ok(parsed.metadata && parsed.metadata.user_id, 'metadata not injected');
   assert.strictEqual(parsed.model, 'claude-sonnet-4-6');
-  const joined = parsed.system.map((b) => b.text || '').join('');
-  assert.ok(joined.includes('You are a helpful assistant.'), 'non-Hermes system content was altered');
+  // System relocation: `system` is reduced to [billing, CC identity]; other
+  // system text moves into the first user message as a <system-reminder>.
+  const sysJoined = parsed.system.map((b) => b.text || '').join('');
+  assert.ok(sysJoined.includes("You are Claude Code, Anthropic's official CLI for Claude."), 'CC identity missing from system');
+  assert.ok(!sysJoined.includes('You are a helpful assistant.'), 'non-identity content should be relocated out of system');
+  const um = parsed.messages.find((mm) => mm.role === 'user');
+  const umText = Array.isArray(um.content) ? um.content.map((c) => c.text || '').join('') : String(um.content);
+  assert.ok(umText.includes('You are a helpful assistant.'), 'relocated content missing from first user message');
+  assert.ok(umText.includes('<system-reminder>'), 'relocated content not wrapped in <system-reminder>');
+});
+
+test('processBody: legacy mode (billingAsHeader:false) still injects the billing system block', () => {
+  const plain = 'You are a helpful assistant. '.repeat(100);
+  const body = JSON.stringify({
+    model: 'claude-sonnet-4-6',
+    system: [{ type: 'text', text: plain }],
+    messages: [{ role: 'user', content: 'hello' }],
+  });
+  const out = processBody(body, { ...PB, billingAsHeader: false });
+  const parsed = JSON.parse(out);
+  assert.ok(out.includes('x-anthropic-billing-header'), 'legacy billing block should be injected');
+  const sysJoined = parsed.system.map((b) => b.text || '').join('');
+  assert.ok(sysJoined.includes('cch=00000'), 'legacy in-body cch placeholder missing');
+  assert.ok(sysJoined.includes("You are Claude Code, Anthropic's official CLI for Claude."), 'CC identity missing');
 });

@@ -77,7 +77,8 @@ model:
   default: claude-opus-4-8       # or claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5
 
 providers: {}                    # MUST be empty — see gotcha #1
-fallback_providers: []           # fallbacks would bypass the proxy
+fallback_providers: []           # optional; to keep fallbacks on the subscription
+                                 # route them through the proxy too — see "Fallback models"
 
 prompt_caching:
   enabled: true                  # fewer reprocessed tokens = more stable fingerprint
@@ -91,13 +92,46 @@ Restart the gateway after any config change (`python hermes_cli/main.py gateway 
 
 1. **`providers: { anthropic: {...} }` collides.** Defining a *custom* provider named `anthropic` makes Hermes rewrite the provider to `anthropic:anthropic` → **"Unknown provider"**. Keep `providers: {}` empty; the built-in `anthropic` provider already reads `model.base_url` and pulls real Claude Code OAuth from the credential pool.
 2. **The `/anthropic` suffix on `base_url` is mandatory (June 2026+).** Hermes' `_anthropic_base_url_override_ok()` silently **discards** a `provider: anthropic` `base_url` and falls back to `https://api.anthropic.com` — bypassing the proxy, so *everything* bills to extra usage — unless the host is `*.anthropic.com`/`*.claude.com`/`*.azure.com` **or the path ends in `/anthropic`**. So a loopback proxy URL must be `http://127.0.0.1:18802/anthropic`; the proxy strips that prefix before forwarding. Tell-tale: `/health` shows `requestsServed: 0` (no traffic reaches the proxy at all) even while billing falls to extra usage.
-3. **Avoid `provider: custom`.** After recent Hermes updates it no longer honors `model.api_mode` (resolves to `chat_completions` → `/chat/completions` → 400 `tools.0.type` against the proxy's Anthropic stubs) **and** fails the credential check ("No usable credentials for custom") unless `api_key` is exactly the `no-key-required` sentinel. Prefer `provider: anthropic`.
-3. **`anthropic` package must be installed** in the Hermes venv, or `anthropic_messages` mode won't load.
-4. **Control test:** the genuine `claude` CLI billing the same way is the baseline — if it bills to subscription and Hermes doesn't, the proxy disguise is the variable.
+3. **Avoid `provider: custom`.** After recent Hermes updates it no longer honors `model.api_mode` (resolves to `chat_completions` → `/chat/completions` → 400 `tools.0.type` against the proxy's Anthropic stubs) **and** fails the credential check ("No usable credentials for custom") unless `api_key` is exactly the `no-key-required` sentinel. Prefer `provider: anthropic`. **This applies to `delegation` and `fallback_providers` too** — see gotcha #5.
+4. **`anthropic` package must be installed** in the Hermes venv, or `anthropic_messages` mode won't load.
+5. **A `base_url` on `delegation`/fallback silently forces `provider: custom`.** Hermes' `_resolve_delegation_credentials()` (and the analogous fallback path) hardcode `provider = "custom"` whenever a `base_url` is set on a non-native provider — *even if you also wrote `provider: anthropic`*. `provider: custom` takes the OpenAI (`chat_completions`) transport, which **bypasses Hermes' own OAuth Claude Code disguise** (the `is_oauth` branch in `anthropic_adapter.py` that prepends the `You are Claude Code…` system prefix and rewrites tool names to `mcp__*`). The request still reaches the proxy on the right endpoint, but without that disguise Anthropic's classifier scores it as non-Claude-Code and bills it to **extra usage** (a 400 once extra usage is exhausted). The tell-tale: the *main* agent bills to subscription but *subagents* (or fallback hits) 400 with "out of extra usage", and the agent log shows `provider=custom` for those turns. Fix: set `provider: anthropic` and **leave `base_url`/`api_key`/`api_mode` empty** so Hermes resolves the built-in `anthropic` provider (which then honors `model.base_url` → the proxy). See [Delegation / subagents](#delegation--subagents).
+6. **Control test:** the genuine `claude` CLI billing the same way is the baseline — if it bills to subscription and Hermes doesn't, the proxy disguise is the variable.
 
 ### Delegation / subagents
 
-Subagents inherit the main provider config and route through the proxy automatically. Only add a `delegation:` provider block if you've overridden it — and if so, point it at the proxy too.
+Subagent delegations bill to the subscription like the main agent, but it takes **two** fixes — one config, one built into the proxy:
+
+1. **Provider/tool gate (config).** Hermes applies its Claude Code disguise (the `You are Claude Code…` prefix + `mcp__*` tool renaming) only on the **`provider: anthropic` OAuth path**. A subagent that resolves to `provider: custom` skips it. So point delegation at the built-in `anthropic` provider:
+
+   ```yaml
+   delegation:
+     provider: anthropic
+     model: claude-opus-4-8   # optional; omit to inherit the main model
+     base_url: ''             # MUST stay empty — a value here forces provider: custom (gotcha #5)
+     api_key: ''
+     api_mode: ''
+   ```
+
+   (Leaving `base_url`/`api_key`/`api_mode` empty is essential — a `base_url` here hardcodes `provider: custom`; see gotcha #5.) Confirm via the agent log: `platform=subagent` turns should show `provider=anthropic`.
+
+2. **System-prompt gate (handled by the proxy's `relocateSystem`).** Anthropic's subscription-vs-extra-usage decision also inspects the **system prompt**. Genuine Claude Code sends a `system` of essentially just its identity line, with context delivered as `<system-reminder>` blocks inside messages. Hermes instead puts its whole framework prompt in `system`; the main agent's rich persona survives that, but a subagent's lean default identity (`…an intelligent AI assistant created by…`) is classified non-Claude-Code and billed to **extra usage**. The proxy fixes this by **relocating the system prompt** (on by default): it reduces `system` to `[billing header, "You are Claude Code, Anthropic's official CLI for Claude."]` and moves every other system block into the first user message as a `<system-reminder>`. The system then reads as genuine Claude Code, so **both main and subagents bill to the subscription** — instructions are preserved, just moved. (Approach credit: [`kristianvast/hermes-claude-auth`](https://github.com/kristianvast/hermes-claude-auth), which does the same relocation as an in-process monkeypatch.)
+
+Verify a delegation bills correctly: `/health` `extraUsageHits` should stay flat while subagent `POST /v1/messages` calls return `200`. Relocation applies to all requests; disable it with `"relocateSystem": false` in `config.json` (e.g. to keep the main agent's persona in `system` — subagents will then fall back to extra usage).
+
+### Fallback models
+
+`fallback_providers` is tried in order when the primary model fails (rate-limit, overload, connection errors). A fallback entry can stay on the subscription by routing through the proxy — use the built-in `anthropic` provider with the `/anthropic` proxy `base_url`, same as the main block. Unlike `delegation`, a fallback entry **does** need its `base_url` (each entry resolves independently), and `provider: anthropic` + that `base_url` still takes the OAuth disguise path here:
+
+```yaml
+fallback_providers:
+  - provider: anthropic
+    model: claude-opus-4-8
+    base_url: http://127.0.0.1:18802/anthropic
+    api_mode: anthropic_messages
+    api_key: no-key-required
+```
+
+To instead spare the subscription during an outage, point a fallback at a cheaper third-party provider (which bypasses the proxy by design).
 
 ### Auxiliary models (compression, vision, title-gen, …)
 
@@ -128,6 +162,7 @@ Create a `config.json` next to `proxy.js` (all keys optional — see `config.exa
 | `mergeDefaults` | `true` | Merge config pattern arrays over built-in defaults (set `false` for full manual control) |
 | `replacements` / `reverseMap` / `toolRenames` / `propRenames` | — | Extra rewrite pairs, merged with defaults |
 | `computeRealCch` | `true` | Compute the real `cch` attestation hash (the subscription-billing signal) |
+| `relocateSystem` | `true` | Reduce `system` to `[billing, CC identity]` and move the rest into the first user message as `<system-reminder>`s — required for subagent (and robust all-request) subscription billing |
 | `repairOrphanedTools` | `true` | Strip orphaned `tool_use`/`tool_result` pairs |
 | `stripTrailingAssistantPrefill` | `true` | Pop trailing assistant prefill messages |
 | `stripEffortForHaiku` | `true` | Remove `effort` for Haiku models |
