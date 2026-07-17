@@ -615,6 +615,9 @@ const DEFAULT_TOOL_RENAMES = [
   ['mcp_parallel_search_read_resource', 'mcp__parallel__read_resource'],
   ['mcp_parallel_search_web_fetch', 'mcp__parallel__web_fetch'],
   ['mcp_parallel_search_web_search', 'mcp__parallel__web_search'],
+  // CoinGecko MCP — same single-underscore issue as ParallelSearch above.
+  ['mcp_coingecko_execute', 'mcp__coingecko__execute'],
+  ['mcp_coingecko_search_docs', 'mcp__coingecko__search_docs'],
   // NOTE: if Hermes exposes other MCP servers, add their tools here mapped to
   // mcp__<server>__<tool>. A raw single-underscore mcp_* name left unmapped will
   // read as foreign and risk tripping detection — keep this list in sync.
