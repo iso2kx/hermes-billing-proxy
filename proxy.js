@@ -1199,24 +1199,45 @@ function ensureReplacers(config) {
 // which must agree), consistent with how the static fwdTools pass operates.
 const _UNMAPPED_MCP_RE = /"mcp_(?!_)([A-Za-z0-9]+)_([A-Za-z0-9_]+)"/g;
 
+// Names this process actually rewrote on the way out, keyed by their canonical
+// wire form (`mcp__server__tool`). The reverse pass consults this so it only
+// un-does ITS OWN disguises. Without the ledger the reverse was a blind
+// "collapse every __ back to _", which mangled two kinds of name it never
+// created:
+//   • a genuine canonical `mcp__server__tool` that Hermes itself put on the
+//     wire (Hermes now emits that shape for MCP tools) -> came back as
+//     `mcp_server_tool`, a name its dispatcher no longer knows;
+//   • a model-invented `mcp__todo` (the model guessing at the mcp__ shape that
+//     most of the disguised tool set wears) -> came back as `mcp_todo`, which
+//     is what Hermes reported as "does not exist" on 2026-07-24/25.
+// The ledger is process-local and self-populating: every request re-disguises
+// the tool defs plus the replayed history, so a name is always registered
+// before the response that echoes it arrives.
+const _genericallyDisguised = new Set();
+
 function disguiseUnmappedMcpTools(body) {
   const found = [];
   const out = body.replace(_UNMAPPED_MCP_RE, (full, server, tool) => {
     found.push(`mcp_${server}_${tool}`);
+    _genericallyDisguised.add(`mcp__${server}__${tool}`);
     return `"mcp__${server}__${tool}"`;
   });
   return { body: out, found };
 }
 
-// Reverse of disguiseUnmappedMcpTools: collapse any leftover canonical
-// `mcp__server__tool` back to Hermes's `mcp_server_tool`. Runs AFTER the static
-// revTools pass, which has already turned every statically-mapped name back into
-// its real Hermes name (leaving no "__"), so this only touches the generically
-// disguised long-tail. Handles plain ("…") and SSE-escaped (\"…\") forms.
+// Reverse of disguiseUnmappedMcpTools: collapse a canonical `mcp__server__tool`
+// back to Hermes's `mcp_server_tool` — but ONLY for names this process disguised
+// (see _genericallyDisguised). Anything else keeping an `mcp__` prefix is either
+// Hermes's own canonical name or a model invention, and both must be passed
+// through untouched: collapsing them produces a name Hermes cannot dispatch.
+// Runs AFTER the static revTools pass and after recoverPrefixedNativeTools.
+// Handles plain ("…") and SSE-escaped (\"…\") forms.
 function reverseUnmappedMcpTools(text) {
+  const collapse = (full, rest, q) =>
+    _genericallyDisguised.has(`mcp__${rest}`) ? `${q}mcp_${rest.replace(/__/g, '_')}${q}` : full;
   return text
-    .replace(/"mcp__([A-Za-z0-9_]+?)"/g, (full, rest) => `"mcp_${rest.replace(/__/g, '_')}"`)
-    .replace(/\\"mcp__([A-Za-z0-9_]+?)\\"/g, (full, rest) => `\\"mcp_${rest.replace(/__/g, '_')}\\"`);
+    .replace(/"mcp__([A-Za-z0-9_]+?)"/g, (full, rest) => collapse(full, rest, '"'))
+    .replace(/\\"mcp__([A-Za-z0-9_]+?)\\"/g, (full, rest) => collapse(full, rest, '\\"'));
 }
 
 // ─── Model-invented `mcp_` prefixes on native Hermes tools ──────────────────
