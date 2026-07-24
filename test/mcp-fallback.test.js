@@ -101,6 +101,15 @@ test('recover: end-to-end, a tool_use naming mcp__todo comes back as todo', () =
     'mcp__todo did not resolve to the real tool');
 });
 
+test('stubs: a Grep/Glob/TodoRead call reverses onto a real Hermes tool', () => {
+  const cfg = { ...PB, toolRenames: [['todo', 'TodoWrite'], ['search_files', 'mcp__ripgrep__search']] };
+  const expect = { Grep: 'search_files', Glob: 'search_files', TodoRead: 'todo' };
+  for (const [stub, real] of Object.entries(expect)) {
+    const out = reverseMap(`{"type":"tool_use","name":"${stub}","input":{}}`, cfg);
+    assert.ok(out.includes(`"name":"${real}"`), `${stub} did not map to ${real}: ${out}`);
+  }
+});
+
 // ─── Round-trip: forward then reverse is the identity ───────────────────────
 
 test('round-trip: forward(reverse) recovers every real unmapped shape', () => {

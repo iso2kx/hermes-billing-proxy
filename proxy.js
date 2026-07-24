@@ -234,13 +234,41 @@ function stripEffortFromObject(str, objectKey) {
 }
 
 // CC tool stubs -- injected into tools array to make the tool set look more
-// like a Claude Code session. The model won't call these (schemas are minimal).
+// like a Claude Code session.
+//
+// The old note here claimed "the model won't call these". It does: state.db has
+// Grep ×10, Agent ×7, Glob ×2 and TodoRead ×1 real calls, every one of which
+// hard-failed with "Tool 'X' does not exist" because a stub has no
+// implementation behind it and no entry in the reverse map. Two changes:
+//   • `Agent` was dropped — real CC's subagent tool is `Task`, which we already
+//     map to Hermes's delegate_task, so the stub was a redundant trap that
+//     shadowed a working tool.
+//   • The survivors that have a compatible Hermes tool are reverse-mapped onto
+//     it via CC_STUB_REVERSALS below, so calling one does the obvious thing
+//     instead of failing.
 const CC_TOOL_STUBS = [
   '{"name":"Glob","description":"Find files by pattern","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern"}},"required":["pattern"]}}',
   '{"name":"Grep","description":"Search file contents","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern"},"path":{"type":"string","description":"Search path"}},"required":["pattern"]}}',
-  '{"name":"Agent","description":"Launch a subagent for complex tasks","input_schema":{"type":"object","properties":{"prompt":{"type":"string","description":"Task description"}},"required":["prompt"]}}',
   '{"name":"NotebookEdit","description":"Edit notebook cells","input_schema":{"type":"object","properties":{"notebook_path":{"type":"string"},"cell_index":{"type":"integer"}},"required":["notebook_path"]}}',
   '{"name":"TodoRead","description":"Read current task list","input_schema":{"type":"object","properties":{}}}'
+];
+
+// Reverse-ONLY aliases: stub name -> the Hermes tool that actually serves it.
+// Deliberately not part of DEFAULT_TOOL_RENAMES — those are bidirectional, and a
+// forward entry here would fight the real disguise (search_files is already sent
+// as mcp__ripgrep__search). Only stubs whose arguments line up are listed:
+//   TodoRead {}                -> todo with no args == read the list (exact)
+//   Grep     {pattern, path}   -> search_files(pattern, path), grep mode (exact)
+//   Glob     {pattern}         -> search_files(pattern); lands in content mode
+//                                 rather than files mode, so it returns a wrong
+//                                 -but-visible result the model can correct,
+//                                 instead of a dead end.
+// NotebookEdit has no Hermes equivalent and is left unmapped (never observed
+// being called).
+const CC_STUB_REVERSALS = [
+  ['TodoRead', 'todo'],
+  ['Grep', 'search_files'],
+  ['Glob', 'search_files'],
 ];
 
 // ─── Billing Fingerprint ────────────────────────────────────────────────────
@@ -1156,11 +1184,17 @@ function ensureReplacers(config) {
     ['"' + cc + '"', '"' + orig + '"'],
     ['\\"' + cc + '\\"', '\\"' + orig + '\\"'],
   ];
+  // Reverse-only stub aliases are appended AFTER the real reversals so they can
+  // never shadow one (the key sets are disjoint today; this keeps it true).
+  const revAlias = ([stub, hermesTool]) => [
+    ['"' + stub + '"', '"' + hermesTool + '"'],
+    ['\\"' + stub + '\\"', '\\"' + hermesTool + '\\"'],
+  ];
   const replacers = {
     fwdReplace: compileReplacer(config.replacements || []),
     fwdTools: compileReplacer(tool.map(quoted)),
     fwdProps: compileReplacer(prop.map(quoted)),
-    revTools: compileReplacer(tool.flatMap(revBoth)),
+    revTools: compileReplacer([...tool.flatMap(revBoth), ...CC_STUB_REVERSALS.flatMap(revAlias)]),
     // Real Hermes tool names (the LHS of every rename), used by
     // recoverPrefixedNativeTools to tell a recoverable `mcp__todo` from a
     // genuine MCP name it must not touch.
@@ -1259,6 +1293,7 @@ function recoverPrefixedNativeTools(text, config) {
     .replace(/"mcp__?([A-Za-z0-9_]+?)"/g, (full, bare) => strip(full, bare, '"'))
     .replace(/\\"mcp__?([A-Za-z0-9_]+?)\\"/g, (full, bare) => strip(full, bare, '\\"'));
 }
+
 // ─── Foreign-tool warning (observability) ───────────────────────────────────
 // Belt-and-suspenders for the disguise: after all forward renames, scan the
 // `tools` array for any name that still doesn't look like genuine Claude Code —
