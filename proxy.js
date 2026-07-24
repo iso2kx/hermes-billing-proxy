@@ -2082,6 +2082,7 @@ function startServer(config) {
       // hermes-* references still work via the hermes-*->claude-* remap in
       // processBody; they're just no longer offered in the picker.
       const models = [
+        { id: 'claude-opus-5',           object: 'model', owned_by: 'anthropic', context_length: 1000000 },
         { id: 'claude-opus-4-8',         object: 'model', owned_by: 'anthropic', context_length: 1000000 },
         { id: 'claude-opus-4-7',         object: 'model', owned_by: 'anthropic', context_length: 1000000 },
         { id: 'claude-sonnet-5',         object: 'model', owned_by: 'anthropic', context_length: 1000000 },
