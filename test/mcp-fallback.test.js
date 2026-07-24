@@ -58,12 +58,24 @@ test('forward: rewrites both a tool def and a matching tool_use name', () => {
 // ─── Reverse: canonical mcp__server__tool -> Hermes mcp_server_tool ──────────
 
 test('reverse: canonical name collapses back to single-underscore', () => {
+  // Only names this process disguised are collapsed, so register them first —
+  // which is exactly what the forward pass does on every real request.
+  disguiseUnmappedMcpTools('"mcp_coingecko_execute" "mcp_coingecko_search_docs"');
   assert.strictEqual(reverseUnmappedMcpTools('"mcp__coingecko__execute"'), '"mcp_coingecko_execute"');
   assert.strictEqual(reverseUnmappedMcpTools('"mcp__coingecko__search_docs"'), '"mcp_coingecko_search_docs"');
 });
 
 test('reverse: handles SSE-escaped tool names', () => {
+  disguiseUnmappedMcpTools('"mcp_coingecko_execute"');
   assert.strictEqual(reverseUnmappedMcpTools('\\"mcp__coingecko__execute\\"'), '\\"mcp_coingecko_execute\\"');
+});
+
+test('reverse: a canonical mcp__ name we never disguised is passed through intact', () => {
+  // Hermes now emits mcp__server__tool itself. Collapsing that to a single
+  // underscore hands its dispatcher a name it does not know. Regression guard
+  // for the latent half of the 2026-07-25 todo failure.
+  const untouched = '"mcp__linear__create_issue"';
+  assert.strictEqual(reverseUnmappedMcpTools(untouched), untouched);
 });
 
 // ─── Model-invented mcp_ prefix on a natively-disguised tool ────────────────
