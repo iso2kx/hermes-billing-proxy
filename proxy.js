@@ -1161,6 +1161,10 @@ function ensureReplacers(config) {
     fwdTools: compileReplacer(tool.map(quoted)),
     fwdProps: compileReplacer(prop.map(quoted)),
     revTools: compileReplacer(tool.flatMap(revBoth)),
+    // Real Hermes tool names (the LHS of every rename), used by
+    // recoverPrefixedNativeTools to tell a recoverable `mcp__todo` from a
+    // genuine MCP name it must not touch.
+    knownToolNames: new Set(tool.map(([orig]) => orig)),
     revProps: compileReplacer(prop.flatMap(revBoth)),
     revStrings: compileReplacer(config.reverseMap || []),
     // Reverse map restricted to entries safe for tool-call arguments: drops the
@@ -1215,6 +1219,25 @@ function reverseUnmappedMcpTools(text) {
     .replace(/\\"mcp__([A-Za-z0-9_]+?)\\"/g, (full, rest) => `\\"mcp_${rest.replace(/__/g, '_')}\\"`);
 }
 
+// ─── Model-invented `mcp_` prefixes on native Hermes tools ──────────────────
+// Most of the disguised tool set wears an `mcp__server__tool` name, so the model
+// sometimes generalises the pattern to a tool that was disguised as a NATIVE CC
+// name — calling `mcp__todo` when the schema it was handed is `TodoWrite`.
+// Hermes has no such tool and the call hard-fails, which is how a whole session
+// lost its task list on 2026-07-25.
+// Recover it: a single-segment `mcp__<bare>` / `mcp_<bare>` whose `<bare>` is a
+// real Hermes tool name is rewritten to `<bare>`. Safe by construction — our own
+// generic disguise always emits TWO segments (`mcp__A__B`), and Hermes's real
+// MCP tools are `mcp_<server>_<tool>`, whose bare remainder ("coingecko_execute")
+// is never a registered native name. Runs BEFORE reverseUnmappedMcpTools.
+function recoverPrefixedNativeTools(text, config) {
+  const known = ensureReplacers(config).knownToolNames;
+  if (!known || known.size === 0) return text;
+  const strip = (full, bare, q) => (known.has(bare) ? `${q}${bare}${q}` : full);
+  return text
+    .replace(/"mcp__?([A-Za-z0-9_]+?)"/g, (full, bare) => strip(full, bare, '"'))
+    .replace(/\\"mcp__?([A-Za-z0-9_]+?)\\"/g, (full, bare) => strip(full, bare, '\\"'));
+}
 // ─── Foreign-tool warning (observability) ───────────────────────────────────
 // Belt-and-suspenders for the disguise: after all forward renames, scan the
 // `tools` array for any name that still doesn't look like genuine Claude Code —
@@ -1662,6 +1685,7 @@ function reverseMap(text, config) {
   // (\"Name\") forms in one regex.
   const replacers = ensureReplacers(config);
   r = replacers.revTools(r);
+  r = recoverPrefixedNativeTools(r, config); // model-invented mcp__todo -> todo
   r = reverseUnmappedMcpTools(r); // collapse generically-disguised mcp__x__y -> mcp_x_y
   r = replacers.revProps(r);
   r = replacers.revStrings(r);
@@ -1680,6 +1704,7 @@ function reverseMapToolArgs(text, config) {
   let r = text;
   const replacers = ensureReplacers(config);
   r = replacers.revTools(r);
+  r = recoverPrefixedNativeTools(r, config); // model-invented mcp__todo -> todo
   r = reverseUnmappedMcpTools(r); // collapse generically-disguised mcp__x__y -> mcp_x_y
   r = replacers.revProps(r);
   r = replacers.revStringsToolSafe(r);
@@ -2407,6 +2432,7 @@ module.exports = {
   compileReplacer,
   disguiseUnmappedMcpTools,
   reverseUnmappedMcpTools,
+  recoverPrefixedNativeTools,
   looksLikeAnthropicMessages,
   relocateSystemToUser,
   buildBillingHeaderValue,

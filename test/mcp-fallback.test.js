@@ -12,6 +12,7 @@ const assert = require('node:assert');
 const {
   disguiseUnmappedMcpTools,
   reverseUnmappedMcpTools,
+  recoverPrefixedNativeTools,
   processBody,
   reverseMap,
 } = require('../proxy.js');
@@ -63,6 +64,29 @@ test('reverse: canonical name collapses back to single-underscore', () => {
 
 test('reverse: handles SSE-escaped tool names', () => {
   assert.strictEqual(reverseUnmappedMcpTools('\\"mcp__coingecko__execute\\"'), '\\"mcp_coingecko_execute\\"');
+});
+
+// ─── Model-invented mcp_ prefix on a natively-disguised tool ────────────────
+
+const RECOVER_CFG = { toolRenames: [['todo', 'TodoWrite'], ['read_file', 'Read']] };
+
+test('recover: model-invented mcp__todo resolves back to the real todo tool', () => {
+  assert.strictEqual(recoverPrefixedNativeTools('"mcp__todo"', RECOVER_CFG), '"todo"');
+  assert.strictEqual(recoverPrefixedNativeTools('"mcp_todo"', RECOVER_CFG), '"todo"');
+  assert.strictEqual(recoverPrefixedNativeTools('\\"mcp__todo\\"', RECOVER_CFG), '\\"todo\\"');
+});
+
+test('recover: leaves genuine MCP names and unknown tools alone', () => {
+  for (const name of ['"mcp__coingecko__execute"', '"mcp_coingecko_execute"', '"mcp__not_a_tool"']) {
+    assert.strictEqual(recoverPrefixedNativeTools(name, RECOVER_CFG), name);
+  }
+});
+
+test('recover: end-to-end, a tool_use naming mcp__todo comes back as todo', () => {
+  const cfg = { ...PB, toolRenames: [['todo', 'TodoWrite']] };
+  const upstream = '{"type":"tool_use","name":"mcp__todo","input":{"todos":[]}}';
+  assert.ok(reverseMap(upstream, cfg).includes('"name":"todo"'),
+    'mcp__todo did not resolve to the real tool');
 });
 
 // ─── Round-trip: forward then reverse is the identity ───────────────────────
