@@ -31,10 +31,112 @@ const os = require('os');
 const crypto = require('crypto');
 const { StringDecoder } = require('string_decoder');
 
+// ─── Logging ────────────────────────────────────────────────────────────────
+// The proxy's console output IS its observability: extra-usage alerts,
+// foreign-tool warnings, upstream rate-limit headers, token-refresh outcomes.
+// Launched from the Windows autostart shim (`WshShell.Run "node proxy.js", 0,
+// False`) stdout/stderr have nowhere to go, so every one of those was being
+// discarded — a billing regression could sit unnoticed for days (and did:
+// the 2026-07-24 extra-usage hit surfaced only via /health, a week later).
+// Tee console.* to a size-rotated file so the record survives regardless of
+// how the proxy was started.
+//   PROXY_LOG=<path>            log file (default proxy.log beside this script;
+//                               "off" disables file logging entirely)
+//   PROXY_LOG_MAX_BYTES=<n>     rotate at this size (default 10MB)
+//   PROXY_LOG_KEEP=<n>          how many rotations to retain (default 3)
+const LOG_DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
+const LOG_DEFAULT_KEEP = 3;
+let _logEnabled = false, _logBytes = 0, _logPath = null, _logMax = 0, _logKeep = 0;
+
+// Appends are synchronous by design. A WriteStream buffers, which (a) loses the
+// tail on a hard crash — exactly the lines worth having — and (b) keeps an open
+// handle, and renaming an open file fails on Windows, so rotation silently
+// no-op'd and the log grew unbounded. Volume here is a couple of lines per
+// request; a ~100-byte appendFileSync costs tens of microseconds.
+// Shift the generation chain: .2 -> .3, .1 -> .2, current -> .1. The oldest kept
+// generation is dropped by being overwritten (renameSync replaces on both
+// Windows and POSIX), so no file beyond `.keep` is ever created. Exported for
+// tests — the original stream-based implementation appeared to work but never
+// actually rotated on Windows, because renaming a file with an open handle
+// throws and the failure was swallowed.
+function rotateLogFiles(logPath, keep) {
+  for (let i = keep - 1; i >= 1; i--) {
+    const from = `${logPath}.${i}`;
+    if (fs.existsSync(from)) fs.renameSync(from, `${logPath}.${i + 1}`);
+  }
+  if (fs.existsSync(logPath)) fs.renameSync(logPath, `${logPath}.1`);
+}
+
+function _rotateLogIfNeeded() {
+  if (_logBytes < _logMax) return;
+  try {
+    rotateLogFiles(_logPath, _logKeep);
+    _logBytes = 0;
+  } catch (e) { /* rotation failed — keep logging rather than losing output */ }
+}
+
+function initLogging() {
+  const target = process.env.PROXY_LOG || path.join(__dirname, 'proxy.log');
+  if (String(target).toLowerCase() === 'off') return;
+  _logPath = target;
+  _logMax = parseInt(process.env.PROXY_LOG_MAX_BYTES, 10) || LOG_DEFAULT_MAX_BYTES;
+  _logKeep = parseInt(process.env.PROXY_LOG_KEEP, 10) || LOG_DEFAULT_KEEP;
+  try { _logBytes = fs.existsSync(_logPath) ? fs.statSync(_logPath).size : 0; } catch (e) { _logBytes = 0; }
+  _logEnabled = true;
+
+  const util = require('util');
+  const tee = (orig, level) => (...args) => {
+    orig(...args);
+    if (!_logEnabled) return;
+    let line;
+    try {
+      line = args.map(a => (typeof a === 'string' ? a : util.inspect(a, { depth: 3 }))).join(' ');
+    } catch (e) { return; }
+    const rec = `${new Date().toISOString()} ${level} ${line}\n`;
+    try {
+      _rotateLogIfNeeded();
+      fs.appendFileSync(_logPath, rec);
+      _logBytes += Buffer.byteLength(rec);
+    } catch (e) { /* never let a logging failure break the proxy */ }
+  };
+  console.log = tee(console.log.bind(console), 'INFO');
+  console.error = tee(console.error.bind(console), 'ERROR');
+  console.warn = tee(console.warn.bind(console), 'WARN');
+
+  // A crash is precisely the event you most want on disk.
+  process.on('uncaughtException', (e) => {
+    console.error(`[PROXY] uncaughtException: ${(e && e.stack) || e}`);
+    flushLogging(() => process.exit(1));
+  });
+  process.on('unhandledRejection', (e) => {
+    console.error(`[PROXY] unhandledRejection: ${(e && e.stack) || e}`);
+  });
+
+  console.log(`[PROXY] Logging to ${_logPath} (rotate at ${(_logMax / 1048576).toFixed(0)}MB, keep ${_logKeep})`);
+}
+
+// Writes are synchronous, so there is nothing buffered to flush — this exists
+// purely as the shutdown seam (and keeps the call sites honest if the sink ever
+// becomes asynchronous again).
+function flushLogging(done) {
+  if (done) done();
+}
+
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18802;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.2.4';
+const VERSION = '2.3.0';
+
+// Socket-inactivity timeout on the upstream leg. Without one, a half-open
+// connection to Anthropic hangs the client until ITS timeout — and with
+// keepAlive sockets in the pool that is a live hang risk, not a theoretical
+// one. (The x-stainless-timeout header we forge is an SDK hint, not something
+// the proxy enforces.) Generous enough for long thinking pauses; Anthropic
+// emits SSE pings well inside it.
+const UPSTREAM_TIMEOUT_MS = parseInt(process.env.PROXY_UPSTREAM_TIMEOUT_MS, 10) || 300000;
+
+// How long to let in-flight requests finish on SIGINT/SIGTERM before exiting.
+const SHUTDOWN_DEADLINE_MS = parseInt(process.env.PROXY_SHUTDOWN_DEADLINE_MS, 10) || 10000;
 
 // Reuse a pool of TLS connections to Anthropic instead of opening a fresh
 // handshake per request. Cuts ~100ms off each call and prevents TIME_WAIT
@@ -164,18 +266,95 @@ function _findClaudeBinPath() {
   return null;
 }
 
+// ── Async re-detection (kept off the request path) ─────────────────────────
+// The sync detectCcVersion/detectBetas above are fine at STARTUP, where nothing
+// is in flight. They are NOT fine mid-flight: on a 250MB claude.exe the version
+// probe costs ~290ms and the beta scan ~400ms, and Node is single-threaded — so
+// re-syncing from the request handler stalled EVERY concurrent stream for ~0.7s,
+// at exactly the moment it matters (a CC auto-update, or an extra-usage
+// response). These variants keep the same logic but never block: the child
+// process is spawned asynchronously, and the binary scan yields to the event
+// loop between chunks, capping any single stall at roughly one chunk (~25ms).
+function detectCcVersionAsync() {
+  return new Promise((resolve) => {
+    if (process.env.CC_VERSION) return resolve(process.env.CC_VERSION);
+    const bin = _findClaudeBinPath() || 'claude';
+    require('child_process').execFile(
+      bin, ['--version'], { timeout: 5000, windowsHide: true },
+      (err, stdout) => {
+        if (err) return resolve(null);
+        const m = String(stdout).match(/(\d+\.\d+\.\d+)/);
+        resolve(m ? m[1] : null);
+      });
+  });
+}
+
+async function detectBetasAsync(fallback) {
+  if (process.env.REQUIRED_BETAS) {
+    return process.env.REQUIRED_BETAS.split(',').map(s => s.trim()).filter(Boolean);
+  }
+  const fsp = fs.promises;
+  try {
+    const bin = _findClaudeBinPath();
+    if (!bin) return fallback;
+    const st = await fsp.stat(bin);
+    const cachePath = path.join(__dirname, '.betas_cache.json');
+    try {
+      const c = JSON.parse(await fsp.readFile(cachePath, 'utf8'));
+      if (c.mtimeMs === st.mtimeMs && Array.isArray(c.betas) && c.betas.length >= 3) return c.betas;
+    } catch (e) { /* no/stale cache — re-extract */ }
+    const fh = await fsp.open(bin, 'r');
+    const CH = 16 * 1024 * 1024, OV = 64;
+    const buf = Buffer.alloc(CH + OV);
+    let posn = 0, carry = '';
+    const found = new Set();
+    try {
+      while (true) {
+        const { bytesRead } = await fh.read(buf, OV, CH, posn);
+        if (bytesRead <= 0) break;
+        const s = carry + buf.toString('latin1', OV, OV + bytesRead);
+        (s.match(BETA_RE) || []).forEach(b => found.add(b));
+        carry = s.slice(-OV);
+        posn += bytesRead;
+        await new Promise(r => setImmediate(r));  // let queued requests through
+      }
+    } finally { await fh.close(); }
+    const list = [...found].filter(b => b !== 'context-1m-2025-08-07');
+    if (list.length < 3) return fallback;
+    try { await fsp.writeFile(cachePath, JSON.stringify({ mtimeMs: st.mtimeMs, betas: list })); } catch (e) {}
+    return list;
+  } catch (e) { return fallback; }
+}
+
 // Re-detect version + betas from the installed CLI; swap them in if changed.
-function refreshCcIdentity(reason) {
-  if (process.env.CC_VERSION) return;
-  const newVersion = detectCcVersion(CC_VERSION);
-  const newBetas = detectBetas(REQUIRED_BETAS);
-  const newHeader = newBetas.join(',');
-  if (newVersion === CC_VERSION && newHeader === REQUIRED_BETAS_HEADER) return;
-  const oldVersion = CC_VERSION;
-  CC_VERSION = newVersion;
-  REQUIRED_BETAS = newBetas;
-  REQUIRED_BETAS_HEADER = newHeader;
-  console.log(`[${new Date().toISOString()}] 🔄 Re-synced Claude Code emulation (${reason}): v${oldVersion} -> v${CC_VERSION}, ${REQUIRED_BETAS.length} betas`);
+// Single-flight: the mtime watch and the extra-usage reactive path can both
+// fire at once, and two concurrent 250MB scans help nobody.
+let _ccRefreshInFlight = false;
+async function refreshCcIdentityAsync(reason) {
+  if (process.env.CC_VERSION || _ccRefreshInFlight) return;
+  _ccRefreshInFlight = true;
+  try {
+    const newVersion = (await detectCcVersionAsync()) || CC_VERSION;
+    const newBetas = await detectBetasAsync(REQUIRED_BETAS);
+    const newHeader = newBetas.join(',');
+    if (newVersion === CC_VERSION && newHeader === REQUIRED_BETAS_HEADER) return;
+    const oldVersion = CC_VERSION;
+    CC_VERSION = newVersion;
+    REQUIRED_BETAS = newBetas;
+    REQUIRED_BETAS_HEADER = newHeader;
+    // STAINLESS_HEADERS baked CC_VERSION into user-agent at module load, so a
+    // re-sync used to leave the UA advertising the OLD version while the billing
+    // header advertised the new one — a self-inflicted mismatch on the very
+    // request the re-sync was meant to rescue. Keep them in lockstep.
+    if (typeof STAINLESS_HEADERS === 'object' && STAINLESS_HEADERS) {
+      STAINLESS_HEADERS['user-agent'] = `claude-cli/${CC_VERSION} (external, cli)`;
+    }
+    console.log(`[${new Date().toISOString()}] 🔄 Re-synced Claude Code emulation (${reason}): v${oldVersion} -> v${CC_VERSION}, ${REQUIRED_BETAS.length} betas`);
+  } catch (e) {
+    console.error(`[PROXY] CC identity re-sync failed (${reason}): ${e.message}`);
+  } finally {
+    _ccRefreshInFlight = false;
+  }
 }
 
 // Proactive: if the CLI binary's mtime changed since we last looked, CC was
@@ -194,7 +373,9 @@ function maybeRefreshCcIdentity() {
     if (_ccBinMtimeMs === null) { _ccBinMtimeMs = mtimeMs; return; }
     if (mtimeMs === _ccBinMtimeMs) return;
     _ccBinMtimeMs = mtimeMs;
-    refreshCcIdentity('CLI binary changed on disk');
+    // Fire-and-forget: the caller is a request handler and must not await a
+    // multi-hundred-millisecond binary scan.
+    void refreshCcIdentityAsync('CLI binary changed on disk');
   } catch (e) { /* try again next interval */ }
 }
 
@@ -1305,18 +1486,52 @@ function recoverPrefixedNativeTools(text, config) {
 // still fires for a brand-new NON-mcp core tool the static map hasn't learned.
 const _warnedForeignTools = new Set();
 
-function warnOnForeignTools(bodyStr) {
+// Genuine Claude Code native tool names. The check used to accept ANY
+// PascalCase name as native (`/^[A-Z]/`), which meant a future Hermes tool
+// called e.g. "SearchWeb" or "ReadDocs" sailed through the one net that exists
+// to catch non-`mcp_` additions — the exact class of miss that caused the
+// 2026-07-17 coingecko extra-usage incident, just with different spelling.
+// Match against the real set instead of a shape.
+const KNOWN_CC_NATIVE_TOOLS = new Set([
+  'Bash', 'BashOutput', 'KillShell', 'KillBash',
+  'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'NotebookRead',
+  'Glob', 'Grep', 'LS', 'Task', 'TodoWrite', 'TodoRead',
+  'WebFetch', 'WebSearch', 'ExitPlanMode', 'SlashCommand', 'AskUserQuestion',
+]);
+
+// Names the proxy itself legitimately puts on the wire: every non-mcp__ target
+// of the rename map, plus the injected CC stubs, plus the known natives above.
+// Cached per-config (non-enumerably, like ensureReplacers).
+function nativeToolAllowlist(config) {
+  if (config && config._nativeToolAllowlist) return config._nativeToolAllowlist;
+  const allow = new Set(KNOWN_CC_NATIVE_TOOLS);
+  for (const [, cc] of (config && config.toolRenames) || []) {
+    if (typeof cc === 'string' && !cc.startsWith('mcp__')) allow.add(cc);
+  }
+  for (const stub of CC_TOOL_STUBS) {
+    try {
+      const name = JSON.parse(stub).name;
+      if (name) allow.add(name);
+    } catch (e) { /* a malformed stub simply contributes nothing */ }
+  }
+  if (config) Object.defineProperty(config, '_nativeToolAllowlist', { value: allow, enumerable: false });
+  return allow;
+}
+
+function warnOnForeignTools(bodyStr, config) {
   const toolsIdx = bodyStr.indexOf('"tools":[');
   if (toolsIdx === -1) return;
   const end = findMatchingBracket(bodyStr, toolsIdx + '"tools":'.length);
   if (end === -1) return;
   const section = bodyStr.slice(toolsIdx, end + 1);
+  const allow = nativeToolAllowlist(config);
   const nameRe = /"name":"([^"]+)"/g;
   let m;
   const foreign = [];
   while ((m = nameRe.exec(section)) !== null) {
     const name = m[1];
-    if (/^mcp__/.test(name) || /^[A-Z]/.test(name)) continue; // mcp__x__y or PascalCase native
+    if (/^mcp__/.test(name)) continue;   // genuine mcp__server__tool
+    if (allow.has(name)) continue;       // genuine native CC tool
     if (_warnedForeignTools.has(name)) continue;
     _warnedForeignTools.add(name);
     foreign.push(name);
@@ -1406,7 +1621,7 @@ function processBody(bodyStr, config, requestUrl) {
 
   // Observability: warn (once per name) about any tool that STILL looks foreign
   // after both rename passes — e.g. a brand-new non-mcp core tool.
-  warnOnForeignTools(m);
+  warnOnForeignTools(m, config);
 
   // Layer 6: Property name renaming (single precompiled pass)
   m = replacers.fwdProps(m);
@@ -1767,6 +1982,34 @@ function reverseMapToolArgs(text, config) {
   return r;
 }
 
+// ─── Error bodies: preserve URLs through the reverse map ────────────────────
+// Upstream error text is diagnostic material, and the reverse map's bare-word
+// 'claude' -> 'hermes' swap rewrites it: Anthropic's
+//   "You're out of extra usage. Add more at claude.ai/settings/usage"
+// arrived as "hermes.ai/settings/usage" — a domain that does not exist. That
+// has actively misdirected debugging (the wording reads as a Hermes-side quota
+// problem when it is an Anthropic billing response). Mask URL-shaped spans,
+// reverse-map the prose around them, then restore them verbatim. Structural
+// reversals (tool names, property keys, .claude-ws/ paths) are unaffected —
+// none of those match a URL span.
+const _URL_SPAN_RE = /\bhttps?:\/\/[^\s"'\\<>)]+|\b(?:[a-z0-9-]+\.)+(?:ai|com|org|net|io|dev|app)\b(?:\/[^\s"'\\<>)]*)?/gi;
+const URL_MASK_PREFIX = '__OBP_URL_MASK_';
+const URL_MASK_SUFFIX = '__';
+
+function reverseMapErrorBody(text, config) {
+  const spans = [];
+  const masked = text.replace(_URL_SPAN_RE, (hit) => {
+    spans.push(hit);
+    return URL_MASK_PREFIX + (spans.length - 1) + URL_MASK_SUFFIX;
+  });
+  if (spans.length === 0) return reverseMap(text, config);
+  let out = reverseMap(masked, config);
+  for (let i = 0; i < spans.length; i++) {
+    out = out.split(URL_MASK_PREFIX + i + URL_MASK_SUFFIX).join(spans[i]);
+  }
+  return out;
+}
+
 // Reverse-map a whole (non-streaming) response buffer, scoping the reverse so
 // tool_use input objects get the tool-arg-safe map while everything else (visible
 // text, tool-name envelopes) gets the full map. Reuses maskToolUseInputs to
@@ -2096,9 +2339,104 @@ function looksLikeAnthropicMessages(s) {
   return false;
 }
 
+// ─── Model catalog ──────────────────────────────────────────────────────────
+// Hermes discovers context-window sizes from this endpoint, so the list has to
+// carry context_length — which Anthropic's real /v1/models does NOT return.
+// The list used to be fully hand-written, meaning every model launch needed a
+// proxy edit (done by hand for sonnet-5 and opus-5) and a missed edit silently
+// capped a new model at the 128K default. Now: ask Anthropic what exists, and
+// supply context_length by rule. The curated ids stay as an offline fallback
+// AND are always unioned in, so a model the API doesn't list yet (or a lookup
+// failure) can never make one disappear from the picker.
+// 1M context is GENERATION-gated on the subscription: opus/sonnet from 4.6
+// onward (plus the fable line) carry it; older snapshots top out at 200K, and
+// haiku always does. Expressed as a threshold rather than an enumeration so a
+// future opus-6 / sonnet-6 is correct with no proxy edit — while an older id
+// the upstream catalog also returns (sonnet-4-5, opus-4-1) is NOT over-reported.
+// Direction matters here: under-reporting context is harmless, over-reporting
+// makes Hermes pack a window the model doesn't have and hard-400 on overflow.
+const MILLION_CTX_MIN_GENERATION = [4, 6];
+const MODEL_CONTEXT_1M = 1000000;
+const MODEL_CONTEXT_DEFAULT = 200000;
+const FALLBACK_MODEL_IDS = [
+  'claude-opus-5',
+  'claude-opus-4-8',
+  'claude-opus-4-7',
+  'claude-sonnet-5',
+  'claude-sonnet-4-6',
+  'claude-haiku-4-5',
+  'claude-fable-5',
+];
+const MODELS_CACHE_MS = 60 * 60 * 1000;
+let _modelsCache = { at: 0, ids: null };
+
+function contextLengthFor(id) {
+  const s = String(id || '').toLowerCase();
+  if (s.includes('haiku')) return MODEL_CONTEXT_DEFAULT;
+  if (s.includes('fable')) return MODEL_CONTEXT_1M;
+  const m = s.match(/(?:opus|sonnet)-(\d+)(?:-(\d+))?/);
+  if (!m) return MODEL_CONTEXT_DEFAULT;
+  // Tuple compare, not parseFloat: "4-10" must rank above "4-6", and 4.10 < 4.6.
+  const major = parseInt(m[1], 10), minor = parseInt(m[2] || '0', 10);
+  const [minMajor, minMinor] = MILLION_CTX_MIN_GENERATION;
+  const has1M = major > minMajor || (major === minMajor && minor >= minMinor);
+  return has1M ? MODEL_CONTEXT_1M : MODEL_CONTEXT_DEFAULT;
+}
+
+function buildModelList(ids) {
+  return ids.map(id => ({
+    id, object: 'model', owned_by: 'anthropic', context_length: contextLengthFor(id),
+  }));
+}
+
+// Curated ids first (preferred ordering in the picker), then anything upstream
+// knows about that we don't.
+function mergeModelIds(upstreamIds) {
+  const out = [...FALLBACK_MODEL_IDS];
+  const seen = new Set(out);
+  for (const id of upstreamIds || []) if (!seen.has(id)) { seen.add(id); out.push(id); }
+  return out;
+}
+
+// Resolves to an array of claude-* ids, or null on any failure (offline, auth,
+// non-200, malformed) — callers fall back to the curated list.
+function fetchUpstreamModels(config) {
+  return new Promise((resolve) => {
+    let oauth;
+    try { oauth = getToken(config.credsPath); } catch (e) { return resolve(null); }
+    const req = https.request({
+      hostname: UPSTREAM_HOST, port: 443, path: '/v1/models?limit=100',
+      method: 'GET', agent: UPSTREAM_AGENT, timeout: 10000,
+      headers: {
+        ...STAINLESS_HEADERS,
+        authorization: `Bearer ${oauth.accessToken}`,
+        'anthropic-version': '2023-06-01',
+        'accept-encoding': 'identity',
+      },
+    }, (up) => {
+      const chunks = [];
+      up.on('data', c => chunks.push(c));
+      up.on('end', () => {
+        if (up.statusCode !== 200) return resolve(null);
+        try {
+          const parsed = JSON.parse(Buffer.concat(chunks).toString());
+          const ids = (parsed.data || [])
+            .map(m => m && m.id)
+            .filter(id => typeof id === 'string' && id.startsWith('claude-'));
+          resolve(ids.length ? ids : null);
+        } catch (e) { resolve(null); }
+      });
+    });
+    req.on('timeout', () => req.destroy());
+    req.on('error', () => resolve(null));
+    req.end();
+  });
+}
+
 // ─── Server ─────────────────────────────────────────────────────────────────
 function startServer(config) {
   let requestCount = 0;
+  let inFlight = 0;
   const startedAt = Date.now();
   // Billing health: track when Anthropic bills a request to extra usage (i.e. the
   // cch/disguise is no longer recognized as genuine Claude Code). This is the
@@ -2106,6 +2444,11 @@ function startServer(config) {
   let extraUsageHits = 0, lastExtraUsageAt = null;
 
   const server = http.createServer((req, res) => {
+    // In-flight accounting for graceful shutdown. 'close' fires on normal
+    // completion AND on client disconnect, so the counter can't leak.
+    inFlight++;
+    let counted = true;
+    res.on('close', () => { if (counted) { counted = false; inFlight--; } });
     // Strip the /anthropic routing prefix up front so EVERY route sees the real
     // path: /health, the curated /v1/models (context-window discovery), and the
     // proxied API path. Hermes appends /anthropic to base_url (README Gotcha #2);
@@ -2128,9 +2471,21 @@ function startServer(config) {
           requestsServed: requestCount,
           uptime: Math.floor((Date.now() - startedAt) / 1000) + 's',
           // subscriptionBilling flips to "extra-usage" the moment cch is rejected.
+          // NOTE: this is a LATCHED counter for the process lifetime, not live
+          // state — a stale "extra-usage" here is history. Read lastExtraUsageAt.
           subscriptionBilling: extraUsageHits === 0 ? 'ok' : 'extra-usage',
           extraUsageHits,
           lastExtraUsageAt,
+          // If the xxHash64 self-test ever fails, applyCch/buildBillingHeaderValue
+          // silently leave cch=00000 and every request quietly bills to extra
+          // usage. That was previously invisible: no test, no health field, no
+          // log. Surface it so the degradation is greppable.
+          cchAttestation: config.computeRealCch === false
+            ? 'disabled (computeRealCch:false)'
+            : (CCH_XXH_OK
+                ? 'active'
+                : 'DEGRADED — xxh64 self-test failed; cch=00000, billing will fall to extra usage'),
+          cchMode: config.billingAsHeader !== false ? 'http-header' : 'in-system-block (legacy)',
           ccVersion: CC_VERSION,
           tokenExpiresInHours: isFinite(expiresIn) ? expiresIn.toFixed(1) : 'n/a',
           subscriptionType: oauth.subscriptionType,
@@ -2153,26 +2508,30 @@ function startServer(config) {
     // /v1/models and /models — return supported model list so callers
     // can discover context-window sizes instead of falling back to 128K.
     if ((req.url === '/v1/models' || req.url === '/models') && req.method === 'GET') {
-      // Advertise both `hermes-*` (legacy aliases) and `claude-*` (real
-      // upstream names) so the host can discover correct context_length
-      // regardless of which naming the config.yaml uses. The outbound
-      // path-rewrite at line 828 maps hermes-* → claude-* before the
-      // request leaves the proxy, so both forms route identically.
-      // Only the real Claude model ids are listed — these go straight to
-      // Anthropic with no model remap (cleaner, one less fingerprint). Legacy
-      // hermes-* references still work via the hermes-*->claude-* remap in
-      // processBody; they're just no longer offered in the picker.
-      const models = [
-        { id: 'claude-opus-5',           object: 'model', owned_by: 'anthropic', context_length: 1000000 },
-        { id: 'claude-opus-4-8',         object: 'model', owned_by: 'anthropic', context_length: 1000000 },
-        { id: 'claude-opus-4-7',         object: 'model', owned_by: 'anthropic', context_length: 1000000 },
-        { id: 'claude-sonnet-5',         object: 'model', owned_by: 'anthropic', context_length: 1000000 },
-        { id: 'claude-sonnet-4-6',       object: 'model', owned_by: 'anthropic', context_length: 1000000 },
-        { id: 'claude-haiku-4-5',        object: 'model', owned_by: 'anthropic', context_length: 200000 },
-        { id: 'claude-fable-5',          object: 'model', owned_by: 'anthropic', context_length: 1000000 },
-      ];
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ object: 'list', data: models }));
+      // Only real claude-* ids are served — they go straight to Anthropic with
+      // no model remap (one less fingerprint). Legacy hermes-* references still
+      // work via the hermes-*->claude-* remap in processBody; they are simply no
+      // longer offered in the picker.
+      const serve = (ids, source) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', data: buildModelList(ids) }));
+        console.log(`[MODELS] served ${ids.length} models (${source})`);
+      };
+      const now = Date.now();
+      if (_modelsCache.ids && now - _modelsCache.at < MODELS_CACHE_MS) {
+        serve(_modelsCache.ids, 'cache');
+        return;
+      }
+      fetchUpstreamModels(config).then((upstreamIds) => {
+        if (upstreamIds) {
+          const merged = mergeModelIds(upstreamIds);
+          _modelsCache = { at: now, ids: merged };
+          serve(merged, 'upstream');
+        } else {
+          // No cache poisoning on failure: retry upstream on the next call.
+          serve(FALLBACK_MODEL_IDS, 'fallback (upstream lookup failed)');
+        }
+      });
       return;
     }
 
@@ -2293,7 +2652,8 @@ function startServer(config) {
       const upstream = https.request({
         hostname: UPSTREAM_HOST, port: 443,
         path: upstreamPath, method: req.method, headers,
-        agent: UPSTREAM_AGENT
+        agent: UPSTREAM_AGENT,
+        timeout: UPSTREAM_TIMEOUT_MS
       }, (upRes) => {
         const status = upRes.statusCode;
         console.log(`[${ts}] #${reqNum} > ${status}`);
@@ -2333,7 +2693,7 @@ function startServer(config) {
               // recover without a manual restart — independent of the mtime watch.
               if (Date.now() - _ccReactiveRefreshAt > 30000) {
                 _ccReactiveRefreshAt = Date.now();
-                refreshCcIdentity('extra-usage response — re-checking CLI version');
+                void refreshCcIdentityAsync('extra-usage response — re-checking CLI version');
               }
               // Dump processed body for debugging (gated — opt in with DEBUG_DUMPS=1)
               if (process.env.DEBUG_DUMPS) {
@@ -2343,7 +2703,8 @@ function startServer(config) {
                 console.error(`[${ts}] #${reqNum} Body dumped to ${debugPath}`);
               }
             }
-            errBody = reverseMap(errBody, config);
+            // URL-preserving reverse: keeps claude.ai/settings/usage readable.
+            errBody = reverseMapErrorBody(errBody, config);
             const nh = { ...upRes.headers };
             delete nh['transfer-encoding']; // avoid conflict with content-length
             nh['content-length'] = Buffer.byteLength(errBody);
@@ -2399,11 +2760,21 @@ function startServer(config) {
           });
         }
       });
+      // Socket inactivity on the upstream leg. Without this a half-open
+      // connection to Anthropic hangs the client indefinitely.
+      upstream.on('timeout', () => {
+        console.error(`[${ts}] #${reqNum} upstream inactive for ${UPSTREAM_TIMEOUT_MS}ms — aborting`);
+        upstream.destroy(new Error(`upstream timeout after ${UPSTREAM_TIMEOUT_MS}ms`));
+      });
       upstream.on('error', e => {
         console.error(`[${ts}] #${reqNum} ERR: ${e.message}`);
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
+        } else if (!res.writableEnded) {
+          // Mid-stream failure: previously this fell through and left the client
+          // waiting on a response that would never finish. End it instead.
+          res.end();
         }
       });
       upstream.write(body);
@@ -2435,6 +2806,13 @@ function startServer(config) {
       console.log(`  CC headers:        Stainless SDK + identity`);
       console.log(`  Credentials:       ${config.credsPath}`);
       console.log(`\n  Ready. Set openclaw.json baseUrl to http://${bindHost}:${config.port}\n`);
+
+      // A failed xxh64 self-test degrades cch to the 00000 placeholder, which
+      // bills every request to extra usage — silently. Say so at full volume.
+      if (config.computeRealCch !== false && !CCH_XXH_OK) {
+        console.error('[PROXY] ⚠️  cch DEGRADED: xxHash64 self-test failed. Requests will send ' +
+          'cch=00000 and bill to EXTRA USAGE, not the subscription. Check /health -> cchAttestation.');
+      }
 
       // Credential refresh scheduler
       if (config.refreshEnabled && config.credsPath !== 'env') {
@@ -2473,12 +2851,49 @@ function startServer(config) {
     }
   });
 
-  process.on('SIGINT', () => process.exit(0));
-  process.on('SIGTERM', () => process.exit(0));
+  // ── Graceful shutdown ─────────────────────────────────────────────────────
+  // Previously SIGINT/SIGTERM called process.exit(0) immediately, killing
+  // in-flight streams mid-response — a restart during an active Hermes turn
+  // truncated it. Stop accepting, let what's running finish, then exit; a
+  // deadline guarantees we still terminate if a stream is wedged.
+  let shuttingDown = false;
+  const shutdown = (signal) => {
+    if (shuttingDown) { return; }
+    shuttingDown = true;
+    console.log(`[PROXY] ${signal} — draining ${inFlight} in-flight request(s), ${SHUTDOWN_DEADLINE_MS}ms deadline`);
+    let done = false;
+    const finish = (why, code) => {
+      if (done) return;
+      done = true;
+      console.log(`[PROXY] shutdown: ${why}`);
+      flushLogging(() => process.exit(code));
+    };
+    try {
+      server.close(() => { if (inFlight <= 0) finish('all connections closed', 0); });
+      // Idle keep-alive sockets would otherwise hold server.close() open.
+      if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections();
+    } catch (e) { /* fall through to the poll/deadline below */ }
+    const startedDraining = Date.now();
+    const poll = setInterval(() => {
+      if (inFlight <= 0) {
+        clearInterval(poll);
+        finish('drained cleanly', 0);
+      } else if (Date.now() - startedDraining >= SHUTDOWN_DEADLINE_MS) {
+        clearInterval(poll);
+        finish(`deadline reached with ${inFlight} still in flight`, 1);
+      }
+    }, 100);
+    if (poll.unref) poll.unref();
+  };
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 if (require.main === module) {
+  // Before loadConfig(), which can exit(1) on a credentials failure — that
+  // message is worth having on disk too.
+  initLogging();
   const config = loadConfig();
   startServer(config);
 }
@@ -2486,6 +2901,19 @@ if (require.main === module) {
 module.exports = {
   loadConfig,
   compileReplacer,
+  rotateLogFiles,
+  xxh64,
+  CCH_XXH_OK,
+  CCH_SEED,
+  applyCch,
+  reverseMapErrorBody,
+  warnOnForeignTools,
+  nativeToolAllowlist,
+  KNOWN_CC_NATIVE_TOOLS,
+  contextLengthFor,
+  buildModelList,
+  mergeModelIds,
+  FALLBACK_MODEL_IDS,
   disguiseUnmappedMcpTools,
   reverseUnmappedMcpTools,
   recoverPrefixedNativeTools,
