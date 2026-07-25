@@ -6,4 +6,6 @@ node_modules/
 .betas_cache.json
 proxy-stdout.log
 proxy-stderr.log
+proxy.log
+proxy.log.*
 .claude/
