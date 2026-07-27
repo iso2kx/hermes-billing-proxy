@@ -788,7 +788,23 @@ const DEFAULT_TOOL_RENAMES = [
   ['patch', 'Edit'],
   ['delegate_task', 'Task'],
   ['todo', 'TodoWrite'],
+  // Hermes's tool-search bridge (tools/tool_search.py). When ANY deferrable
+  // (MCP/plugin) tool exists, Hermes replaces those tools in the visible array
+  // with three bridge tools — tool_search/tool_describe/tool_call — and moves
+  // the real names into a text catalog inside tool_search's DESCRIPTION. Those
+  // three bare names are foreign on both counts (not native CC, not mcp__), so
+  // without these entries the whole request reads as non-Claude-Code.
+  // `tool_search` maps to the genuine native CC name; the other two have no
+  // native analogue (real CC calls a loaded tool by its own name rather than
+  // wrapping dispatch), so they take the mcp__ shape like every other non-core
+  // tool. NOTE: Anthropic's own tool-search beta is a different layer — those
+  // are SERVER tools (`tool_search_tool_bm25_20251119` / `..._regex_...`) with
+  // a `type` discriminator and no client-side execution, so they are not a
+  // rename target for this client-side bridge.
+  ['tool_search', 'ToolSearch'],
   // ── Everything else -> genuine `mcp__<server>__<tool>` convention ──
+  ['tool_describe', 'mcp__toolbridge__describe'],
+  ['tool_call', 'mcp__toolbridge__call'],
   ['execute_code', 'mcp__pyexec__run'],
   ['search_files', 'mcp__ripgrep__search'],
   ['memory', 'mcp__memory__store'],
@@ -830,6 +846,18 @@ const DEFAULT_TOOL_RENAMES = [
   // NOTE: if Hermes exposes other MCP servers, add their tools here mapped to
   // mcp__<server>__<tool>. A raw single-underscore mcp_* name left unmapped will
   // read as foreign and risk tripping detection — keep this list in sync.
+  // Desktop/TUI surface tools (tui_gateway). These are plugin tools, NOT MCP,
+  // so they arrive as bare single-underscore names that disguiseUnmappedMcpTools
+  // cannot help with (it only rewrites names already prefixed `mcp_`). They went
+  // out foreign from 2026-07-26 until this entry was added — the same gap class
+  // as the 2026-07-17 coingecko incident, just without the mcp_ prefix.
+  ['close_terminal', 'mcp__workspace__close_terminal'],
+  ['read_terminal', 'mcp__workspace__read_terminal'],
+  ['focus_pane', 'mcp__workspace__focus_pane'],
+  ['open_preview', 'mcp__workspace__open_preview'],
+  ['project_create', 'mcp__project__create'],
+  ['project_list', 'mcp__project__list'],
+  ['project_switch', 'mcp__project__switch'],
   // Home Assistant toolset (if enabled)
   ['ha_list_entities', 'mcp__homeassistant__list_entities'],
   ['ha_get_state', 'mcp__homeassistant__get_state'],
@@ -1455,6 +1483,100 @@ function reverseUnmappedMcpTools(text) {
     .replace(/\\"mcp__([A-Za-z0-9_]+?)\\"/g, (full, rest) => collapse(full, rest, '\\"'));
 }
 
+// ─── Generic FOREIGN tool disguise (the non-`mcp_` half of self-healing) ────
+// disguiseUnmappedMcpTools above only rescues names ALREADY shaped
+// `mcp_<server>_<tool>`. That leaves the other half of the hole wide open: a
+// Hermes core or plugin tool the static map never learned carries no `mcp_`
+// prefix, so nothing rewrites it and it goes out foreign. That is exactly how
+// the tui_gateway tools (close_terminal, project_create, …) billed to extra
+// usage from 2026-07-26, and how the tool_search bridge would have. Three
+// incidents, one root cause: DEFAULT_TOOL_RENAMES is hand-maintained.
+//
+// This pass closes it. Any name still reading foreign after BOTH rename passes
+// is rewritten to the canonical `mcp__<a>__<b>` shape, split on the first
+// underscore — the same shape (and the same reasoning) as the mcp_ fallback:
+// Anthropic keys on the SHAPE, not on a correct server/tool boundary.
+//
+// Scope is deliberately narrow, because this rewrite — like every forward tool
+// rename — is a body-wide quoted-token replacement, so it would also hit the
+// same token appearing as request DATA:
+//   • only names that actually appear in THIS request's `tools` array, and
+//   • only names containing an underscore. Every real offender qualifies
+//     (tool_search, close_terminal, project_create). A bare single word like
+//     `memory` is far too likely to occur as ordinary data to blind-replace,
+//     so it is left to warnOnForeignTools to surface for a hand-written entry.
+//
+// Reversal is LEDGER-driven, not shape-driven, so it is lossless for any
+// original spelling (unlike the mcp_ pass, we cannot reconstruct the original
+// by collapsing `__`→`_`: `close_terminal` and `close__terminal` would both
+// come back the same). Collisions — with a name the mcp_ pass already claimed,
+// or with a different foreign tool — take a numeric suffix; if even that is
+// exhausted the tool is left alone and the warning fires, which is strictly
+// better than an un-reversible rename.
+const _foreignDisguised = new Map();  // canonical wire name -> original Hermes name
+const _foreignAssigned = new Map();   // original Hermes name -> canonical wire name
+let _foreignVersion = 0;              // bumped on every new ledger entry
+let _foreignRevCache = null;
+let _foreignRevCacheVersion = -1;
+
+function disguiseForeignTools(body, config) {
+  const toolsIdx = body.indexOf('"tools":[');
+  if (toolsIdx === -1) return { body, found: [] };
+  const end = findMatchingBracket(body, toolsIdx + '"tools":'.length);
+  if (end === -1) return { body, found: [] };
+  const section = body.slice(toolsIdx, end + 1);
+  const allow = nativeToolAllowlist(config);
+  const nameRe = /"name":"([^"]+)"/g;
+  const renames = [];
+  const found = [];
+  const seen = new Set();
+  let m;
+  while ((m = nameRe.exec(section)) !== null) {
+    const name = m[1];
+    if (seen.has(name)) continue;
+    seen.add(name);
+    if (/^mcp__/.test(name)) continue;  // already canonical
+    if (allow.has(name)) continue;      // genuine native Claude Code tool
+    if (!name.includes('_')) continue;  // too generic to blind-replace body-wide
+    let canon = _foreignAssigned.get(name);
+    if (!canon) {
+      const cut = name.indexOf('_');
+      const base = `mcp__${name.slice(0, cut)}__${name.slice(cut + 1)}`;
+      // Taken by the mcp_ pass, or by a DIFFERENT foreign tool? Suffix it.
+      const taken = (c) => _genericallyDisguised.has(c) ||
+        (_foreignDisguised.has(c) && _foreignDisguised.get(c) !== name);
+      let cand = base;
+      for (let n = 2; taken(cand) && n <= 10; n++) cand = `${base}${n}`;
+      if (taken(cand)) continue;  // give up — warnOnForeignTools reports it
+      canon = cand;
+      _foreignDisguised.set(canon, name);
+      _foreignAssigned.set(name, canon);
+      _foreignVersion++;
+    }
+    renames.push([`"${name}"`, `"${canon}"`]);
+    found.push(name);
+  }
+  if (renames.length === 0) return { body, found: [] };
+  return { body: compileReplacer(renames)(body), found };
+}
+
+// Reverse of disguiseForeignTools, driven entirely by the ledger so it can only
+// ever un-do names THIS process created. Handles plain ("…") and SSE-escaped
+// (\"…\") forms, like every other reverse pass. The compiled replacer is cached
+// and rebuilt only when the ledger actually grows.
+function reverseForeignTools(text) {
+  if (_foreignDisguised.size === 0) return text;
+  if (_foreignRevCacheVersion !== _foreignVersion) {
+    const pairs = [];
+    for (const [canon, orig] of _foreignDisguised) {
+      pairs.push([`"${canon}"`, `"${orig}"`], [`\\"${canon}\\"`, `\\"${orig}\\"`]);
+    }
+    _foreignRevCache = compileReplacer(pairs);
+    _foreignRevCacheVersion = _foreignVersion;
+  }
+  return _foreignRevCache(text);
+}
+
 // ─── Model-invented `mcp_` prefixes on native Hermes tools ──────────────────
 // Most of the disguised tool set wears an `mcp__server__tool` name, so the model
 // sometimes generalises the pattern to a tool that was disguised as a NATIVE CC
@@ -1497,6 +1619,11 @@ const KNOWN_CC_NATIVE_TOOLS = new Set([
   'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'NotebookRead',
   'Glob', 'Grep', 'LS', 'Task', 'TodoWrite', 'TodoRead',
   'WebFetch', 'WebSearch', 'ExitPlanMode', 'SlashCommand', 'AskUserQuestion',
+  // Claude Code's own deferred-tool-discovery tool — the rename target for
+  // Hermes's `tool_search` bridge. nativeToolAllowlist() would admit it anyway
+  // (every non-mcp__ rename target is allowed), but this set is meant to be the
+  // real native roster, so keep it accurate rather than relying on that.
+  'ToolSearch',
 ]);
 
 // Names the proxy itself legitimately puts on the wire: every non-mcp__ target
@@ -1619,8 +1746,16 @@ function processBody(bodyStr, config, requestUrl) {
   // subscription with no manual DEFAULT_TOOL_RENAMES entry. Self-healing.
   m = disguiseUnmappedMcpTools(m).body;
 
+  // Layer 3c: Generic FOREIGN fallback — the non-`mcp_` half. Catches a core or
+  // plugin tool the static map never learned (no mcp_ prefix, so 3b cannot see
+  // it): tui_gateway's close_terminal/project_create, the tool_search bridge.
+  // Together with 3b this makes DEFAULT_TOOL_RENAMES about NICER names rather
+  // than "keep it in sync or silently bill extra usage".
+  m = disguiseForeignTools(m, config).body;
+
   // Observability: warn (once per name) about any tool that STILL looks foreign
-  // after both rename passes — e.g. a brand-new non-mcp core tool.
+  // after all three rename passes — i.e. one 3c deliberately declined to touch
+  // (a single-word name, or an unresolvable canonical-name collision).
   warnOnForeignTools(m, config);
 
   // Layer 6: Property name renaming (single precompiled pass)
@@ -1958,6 +2093,7 @@ function reverseMap(text, config) {
   r = replacers.revTools(r);
   r = recoverPrefixedNativeTools(r, config); // model-invented mcp__todo -> todo
   r = reverseUnmappedMcpTools(r); // collapse generically-disguised mcp__x__y -> mcp_x_y
+  r = reverseForeignTools(r);     // ledger-driven undo of the non-mcp_ disguise
   r = replacers.revProps(r);
   r = replacers.revStrings(r);
   // Reverse final-sweep removed (see outbound counterpart for rationale).
@@ -1977,6 +2113,7 @@ function reverseMapToolArgs(text, config) {
   r = replacers.revTools(r);
   r = recoverPrefixedNativeTools(r, config); // model-invented mcp__todo -> todo
   r = reverseUnmappedMcpTools(r); // collapse generically-disguised mcp__x__y -> mcp_x_y
+  r = reverseForeignTools(r);     // ledger-driven undo of the non-mcp_ disguise
   r = replacers.revProps(r);
   r = replacers.revStringsToolSafe(r);
   return r;
@@ -2916,6 +3053,8 @@ module.exports = {
   FALLBACK_MODEL_IDS,
   disguiseUnmappedMcpTools,
   reverseUnmappedMcpTools,
+  disguiseForeignTools,
+  reverseForeignTools,
   recoverPrefixedNativeTools,
   looksLikeAnthropicMessages,
   relocateSystemToUser,
