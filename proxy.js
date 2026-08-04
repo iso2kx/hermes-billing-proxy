@@ -918,9 +918,13 @@ const DEFAULT_REVERSE_MAP = [
   ['Session with', 'Telegram (DM with'],
   ['Use markdown for formatting.', 'Please do not use markdown as it does not render.'],
   ['use file tools to share files', 'include MEDIA:/absolute/path/to/file in your response'],
-  // Reverse standalone framework names
-  ['Claude', 'Hermes'],
-  ['claude', 'hermes'],
+  // Reverse standalone framework names. Scoped to 'word' so they restore the
+  // agent's identity in prose without rewriting real tokens that merely contain
+  // the brand: claude.ai URLs (Anthropic's own billing error pointed users at a
+  // hermes.ai domain that does not exist), the claude-api skill name, and paths
+  // like /projects/claude-demo.
+  ['Claude', 'Hermes', 'word'],
+  ['claude', 'hermes', 'word'],
 ];
 
 // Reverse-map entries that are UNSAFE to apply inside tool-call arguments.
@@ -1029,10 +1033,12 @@ function loadConfig() {
   // Users who want full manual control can set "mergeDefaults": false.
   function mergePatterns(defaults, overrides) {
     if (!overrides || overrides.length === 0) return defaults;
+    // Keep whole entries, not [find, replace] pairs — a third element ('word')
+    // carries the bare-word scope flag and must survive a config override.
     const merged = new Map();
-    for (const [find, replace] of defaults) merged.set(find, replace);
-    for (const [find, replace] of overrides) merged.set(find, replace);
-    return [...merged.entries()];
+    for (const e of defaults) merged.set(e[0], e);
+    for (const e of overrides) merged.set(e[0], e);
+    return [...merged.values()];
   }
 
   const useDefaults = config.mergeDefaults !== false;
@@ -1365,19 +1371,78 @@ function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// True when the match at [start, start+len) is glued to an identifier — a path
+// segment, a hyphenated name, a filename, or a domain — rather than standing
+// alone as a word in prose.
+//
+// This is what separates "I am Claude" (a brand mention, safe to swap) from
+// "claude.ai/settings/usage" or "claude-api" or "AppData/Local/hermes" (a real
+// token some tool has to resolve). A blind substring swap can't tell them apart,
+// which is exactly how the identity layer used to hand the model dead paths.
+//
+// The trailing-dot case is deliberately narrow: "claude.ai" is a domain, but
+// "Claude." at the end of a sentence is prose, so a dot only counts as
+// structural when an alphanumeric follows it.
+const IDENT_ADJACENT = /[A-Za-z0-9_\-\/\\]/;
+function isStructuralContext(s, start, len) {
+  const before = start > 0 ? s[start - 1] : '';
+  const after = s[start + len] || '';
+  if (before && (IDENT_ADJACENT.test(before) || before === '.')) return true;
+  if (after && IDENT_ADJACENT.test(after)) return true;
+  if (after === '.' && /[A-Za-z0-9]/.test(s[start + len + 1] || '')) return true;
+  return false;
+}
+
+// Replace every standalone occurrence of `find` with `replace`, leaving any
+// occurrence that is part of a path, filename, hyphenated name, or domain alone.
+// Case-sensitive, so the caller controls Hermes/hermes separately.
+function replaceBareWord(s, find, replace) {
+  if (!s || !find) return s;
+  const re = new RegExp(escapeRegExp(find), 'g');
+  return s.replace(re, (hit, offset) =>
+    isStructuralContext(s, offset, hit.length) ? hit : replace);
+}
+
+// Canary for the failure mode fixed above: a disguised token that escaped back
+// out in a tool call. The forward pass no longer creates these, so anything here
+// means a new leak path — log it loudly rather than letting it rot into the
+// skill library again. Log-only; never mutates the body.
+const DISGUISE_LEAK_RE = /toolkit[-_\/\\][A-Za-z0-9][\w.-]*|AppData[\/\\]+Local[\/\\]+toolkit|toolkit_utils/g;
+let _leakLogged = 0;
+function checkDisguiseLeak(text, where) {
+  if (_leakLogged > 20 || !text || text.indexOf('toolkit') === -1) return;
+  const hits = [...new Set(text.match(DISGUISE_LEAK_RE) || [])];
+  if (hits.length === 0) return;
+  _leakLogged++;
+  console.error(`[${new Date().toISOString()}] ⚠️  DISGUISE LEAK in ${where} — disguised token(s) survived into a tool call and will not resolve on disk: ${hits.join(', ')}. The forward identity pass should not be producing these.`);
+}
+
 // Build a single-pass replacer from [find, replace] pairs. Returns identity when
 // there are no pairs (an empty alternation would match the empty string at every
 // position). Duplicate finds keep the first mapping, matching split/join order.
+//
+// A pair may carry a third element, 'word', marking it as a bare-word identity
+// swap that must NOT fire inside an identifier (see isStructuralContext). Pairs
+// without it keep the old unconditional behaviour, so structural entries such as
+// '.claude-ws/' and 'CLAUDE.md' are unaffected.
 function compileReplacer(pairs) {
   if (!pairs || pairs.length === 0) return (s) => s;
   const map = new Map();
-  for (const [find, replace] of pairs) {
-    if (find && !map.has(find)) map.set(find, replace);
+  const wordOnly = new Set();
+  for (const [find, replace, scope] of pairs) {
+    if (find && !map.has(find)) {
+      map.set(find, replace);
+      if (scope === 'word') wordOnly.add(find);
+    }
   }
   if (map.size === 0) return (s) => s;
   const keys = [...map.keys()].sort((a, b) => b.length - a.length);
   const re = new RegExp(keys.map(escapeRegExp).join('|'), 'g');
-  return (s) => s.replace(re, (hit) => map.get(hit));
+  if (wordOnly.size === 0) return (s) => s.replace(re, (hit) => map.get(hit));
+  return (s) => s.replace(re, (hit, offset, whole) =>
+    (wordOnly.has(hit) && isStructuralContext(whole, offset, hit.length))
+      ? hit
+      : map.get(hit));
 }
 
 // Lazily compile (and cache, non-enumerably) the per-category replacers used by
@@ -2013,11 +2078,33 @@ function processBody(bodyStr, config, requestUrl) {
           const _fw = _FW.toLowerCase();                            // lowercase
           const _oc = String.fromCharCode(111,112,101,110,99,108,97,119); // legacy prefix
           text = text.split(_fw + '_tools').join('toolkit_utils');
-          text = text.split(_FW).join('Toolkit');
-          text = text.split(_fw).join('toolkit');
           text = text.split(_oc + '-imports').join('ext-imports');
-          text = text.split(_oc).join('toolkit');
+          // Bare-name swap, but ONLY where the name stands alone as a word.
+          //
+          // This used to be a blind split/join, and it is a FORWARD-ONLY pass —
+          // nothing maps 'toolkit' back. So every identifier it touched became a
+          // string the model would faithfully repeat into a tool call against a
+          // filesystem that had never heard of it: ~/hermes-projects.json read as
+          // ~/toolkit-projects.json, AppData/Local/hermes as AppData/Local/toolkit,
+          // and the hermes-* skills as toolkit-* (skill_view -> "Skill not found").
+          // 85 such calls across 48 sessions, and the agent eventually wrote
+          // "retry the other prefix" workarounds into its own skill library.
+          //
+          // Skipping structural occurrences is the fix rather than adding a
+          // reverse pass: a reverse would have to run over streaming SSE deltas
+          // and could not distinguish a 'toolkit' we invented from one the model
+          // wrote itself — the exact ambiguity that made the old blanket reverse
+          // corrupt "Redux Toolkit" (see the note further down).
+          text = replaceBareWord(text, _FW, 'Toolkit');
+          text = replaceBareWord(text, _fw, 'toolkit');
+          text = replaceBareWord(text, _oc, 'toolkit');
           stripped += origLen - text.length;
+          // `mutated` gates the re-stringify below, and it used to be set only
+          // when `stripped > 0`. The name-sanitize above can leave the text the
+          // same length or LONGER (Hermes -> Toolkit is +1), so on a request
+          // with nothing to strip the sanitized `parsed` was silently thrown
+          // away and the identity leaked through untouched. Flag the real edit.
+          if (text !== block.text) mutated = true;
           block.text = text;
         }
       }
@@ -2116,6 +2203,7 @@ function reverseMapToolArgs(text, config) {
   r = reverseForeignTools(r);     // ledger-driven undo of the non-mcp_ disguise
   r = replacers.revProps(r);
   r = replacers.revStringsToolSafe(r);
+  checkDisguiseLeak(r, 'tool arguments');
   return r;
 }
 
@@ -3038,6 +3126,9 @@ if (require.main === module) {
 module.exports = {
   loadConfig,
   compileReplacer,
+  isStructuralContext,
+  replaceBareWord,
+  checkDisguiseLeak,
   rotateLogFiles,
   xxh64,
   CCH_XXH_OK,
