@@ -144,6 +144,28 @@ test('identity is disguised even when there is nothing to strip', () => {
   assert.ok(!/\bHermes\b/.test(out), 'a bare brand mention survived');
 });
 
+// The skills trim used to run only inside `if (stripped > 0)`, so a request
+// whose system prompt had an <available_skills> index but no STRIP_PATTERNS
+// boilerplate kept every removable skill. Two transforms, no dependency.
+//
+// The coupling was masked in production by an incidental `.trim()` in the same
+// loop: any system prompt with a trailing newline made `stripped` 1, which was
+// enough to satisfy the gate. So this fixture must have NO leading/trailing
+// whitespace and no 3+ newline run, or it silently stops discriminating.
+test('unused skills are trimmed even when there is nothing to strip', () => {
+  const filler = 'Follow the user instructions carefully and cite files. '.repeat(45);
+  const sys = filler + '<available_skills>\n  gaming:\n' +
+    '    - pokemon-player: play pokemon\n' +
+    '  devops:\n    - hermes-gateway-ops: diagnose the gateway\n' +
+    '</available_skills>';
+  assert.strictEqual(sys, sys.trim(), 'fixture must not be trimmable');
+  assert.ok(!/\n{3,}/.test(sys), 'fixture must not have collapsible newlines');
+
+  const out = processBody(bodyWithSystem(sys), loadConfig());
+  assert.ok(!out.includes('pokemon-player'), 'removable skill survived the trim');
+  assert.ok(out.includes('hermes-gateway-ops'), 'kept skill was trimmed');
+});
+
 test('processBody disguises the brand without inventing dead identifiers', () => {
   const filler = 'Follow the user instructions carefully and cite files. '.repeat(45);
   const sys = 'You are Hermes, an agent.\n' + filler +

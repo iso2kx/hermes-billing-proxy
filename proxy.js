@@ -2108,8 +2108,15 @@ function processBody(bodyStr, config, requestUrl) {
           block.text = text;
         }
       }
-      if (stripped > 0) {
-        // Remove unused skills from <available_skills> to free space
+      // Remove unused skills from <available_skills> to free space.
+      //
+      // This used to sit inside `if (stripped > 0)`, so it silently no-opped on
+      // any request where STRIP_PATTERNS happened to match nothing — two
+      // transforms with no logical dependency, coupled through a length delta.
+      // (Same trap as the `mutated` gate above, which discarded the whole
+      // sanitize when the text got longer instead of shorter.) It runs on its
+      // own terms now; the loop already skips blocks with no skills index.
+      {
         const REMOVE_SKILLS = new Set(['godmode','openhue','opencode','minecraft-modpack-server','pokemon-player','himalaya','ascii-art','ascii-video','manim-video','p5js','songwriting-and-ai-music','dogfood','heartmula','songsee','gif-search','audiocraft','stable-diffusion','segment-anything','clip','obliteratus','lm-evaluation-harness','weights-and-biases','gguf','guidance','llama-cpp','outlines','vllm','dspy','axolotl','grpo-rl-training','peft','pytorch-fsdp','trl-fine-tuning','unsloth','huggingface-hub','modal']);
         const REMOVE_CATS = new Set(['gaming','dogfood','smart-home','red-teaming']);
         for (let i = 0; i < parsed.system.length; i++) {
@@ -2129,11 +2136,14 @@ function processBody(bodyStr, config, requestUrl) {
             const skillsStripped = beforeSkills - b.text.length;
             if (skillsStripped > 0) {
               stripped += skillsStripped;
+              mutated = true;
               console.log(`[HERMES-SKILLS] Removed ${skillsStripped} chars of unused skills`);
             }
           }
         }
-        // NOTE: reinject disabled — any instruction text triggers detection regardless of position
+      }
+      // NOTE: reinject disabled — any instruction text triggers detection regardless of position
+      if (stripped > 0) {
         mutated = true;
         console.log(`[HERMES-STRIP] Stripped ${stripped} chars`);
       }
