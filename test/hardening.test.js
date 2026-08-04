@@ -35,8 +35,8 @@ const CONFIG = {
   reverseMap: [
     ['Claude Code', 'Hermes Agent'],
     ['claude-code', 'hermes-agent'],
-    ['Claude', 'Hermes'],
-    ['claude', 'hermes'],
+    ['Claude', 'Hermes', 'word'],
+    ['claude', 'hermes', 'word'],
   ],
 };
 
@@ -154,10 +154,40 @@ test('error bodies keep claude.ai URLs intact', () => {
   assert.ok(!out.includes('hermes.ai'), 'must not invent a hermes.ai domain');
 });
 
-test('the plain reverse map is what mangled it (documents the regression)', () => {
+// Was: "the plain reverse map is what mangled it (documents the regression)",
+// asserting reverseMap turned claude.ai into hermes.ai and noting the guard
+// could be revisited once the bare-word swap changed. It has: the bare entries
+// are now 'word'-scoped, so the URL survives everywhere, not just in the
+// URL-masked error-body path.
+test('the plain reverse map no longer mangles a claude.ai URL', () => {
   const errBody = "Add more at claude.ai/settings/usage";
-  assert.ok(reverseMap(errBody, CONFIG).includes('hermes.ai'),
-    'if this fails the bare-word swap changed and this guard can be revisited');
+  const out = reverseMap(errBody, CONFIG);
+  assert.ok(out.includes('claude.ai/settings/usage'), `URL was mangled: ${out}`);
+  assert.ok(!out.includes('hermes.ai'), 'must not invent a hermes.ai domain');
+});
+
+test('bare-word identity swap still fires in prose', () => {
+  assert.strictEqual(reverseMap('I am Claude, running here.', CONFIG),
+    'I am Hermes, running here.');
+  assert.strictEqual(reverseMap('Ask Claude.', CONFIG), 'Ask Hermes.');
+});
+
+test('bare-word identity swap skips identifiers and paths', () => {
+  for (const [input, why] of [
+    ['the claude-api skill', 'hyphenated skill name'],
+    ['cd /projects/claude-demo', 'path segment'],
+    ['see docs.claude.com/en', 'domain'],
+    ['open CLAUDE.md', 'filename (structural entry, unchanged)'],
+  ]) {
+    const out = reverseMap(input, CONFIG);
+    if (input.includes('CLAUDE.md')) continue; // covered by its own structural pair
+    assert.ok(!/hermes/i.test(out), `${why}: corrupted -> ${out}`);
+  }
+});
+
+test('compound patterns still beat the bare-word swap', () => {
+  assert.strictEqual(reverseMap('Claude Code and Claude', CONFIG),
+    'Hermes Agent and Hermes');
 });
 
 test('error bodies still reverse-map prose outside URLs', () => {
