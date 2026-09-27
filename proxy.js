@@ -396,19 +396,43 @@ function getModelBetas(modelId) {
   return REQUIRED_BETAS;
 }
 
+// Hermes' auxiliary calls (title generation, command approval, ...) send
+// thinking:{type:"disabled"}. Some models cannot turn thinking off at all:
+// measured 2026-09-28, claude-opus-5-5 and claude-fable-5-1 400 on it, while
+// opus-5, sonnet-5, opus-4-8, sonnet-4-6 and haiku-4-5 accept it. Merely
+// dropping the field let those models default to adaptive thinking, which ate
+// a max_tokens=16 approval budget and returned no text. The nearest they allow
+// is effort "low" (the minimum), and even that sometimes thinks, so the budget
+// is also raised to a floor that fits thinking + answer (8/8 answered, 61-238
+// output tokens). Every other model keeps `disabled` exactly as sent.
+const DISABLED_THINKING_RE = /"thinking"\s*:\s*\{\s*"type"\s*:\s*"disabled"\s*\}/;
+const ADAPTIVE_ONLY_MAX_TOKENS_FLOOR = 1024;
+
+function isAdaptiveOnlyModel(model) {
+  const m = /(opus|sonnet|fable)-(\d+)(?:-(\d+))?(?!\d)/.exec(String(model || '').toLowerCase());
+  if (!m) return false;
+  const version = [parseInt(m[2], 10), parseInt(m[3] || '0', 10)];
+  const [minMajor, minMinor] = m[1] === 'fable' ? [5, 1] : [5, 5];
+  return version[0] > minMajor || (version[0] === minMajor && version[1] >= minMinor);
+}
+
+function adaptDisabledThinking(bodyStr) {
+  if (!DISABLED_THINKING_RE.test(bodyStr)) return bodyStr;
+  let obj;
+  try { obj = JSON.parse(bodyStr); } catch (e) { return bodyStr; }
+  if (!obj.thinking || obj.thinking.type !== 'disabled' || !isAdaptiveOnlyModel(obj.model)) return bodyStr;
+  delete obj.thinking;
+  obj.output_config = { ...(obj.output_config || {}), effort: 'low' };
+  if (typeof obj.max_tokens === 'number' && obj.max_tokens < ADAPTIVE_ONLY_MAX_TOKENS_FLOOR) {
+    obj.max_tokens = ADAPTIVE_ONLY_MAX_TOKENS_FLOOR;
+  }
+  return JSON.stringify(obj);
+}
+
 // Strip the "effort" field from a named object within a raw JSON body. Haiku
 // 400s when sent `effort`, but Opus/Sonnet use it, so callers gate this on the
 // model. Raw-string (no JSON.parse) to preserve the proxy-wide byte-fidelity
 // principle. No-op when the object or the field is absent.
-// Hermes' auxiliary calls (title generation etc.) send thinking:{type:"disabled"},
-// which claude-opus-5-5 rejects with a 400 ("use thinking.type.adaptive").
-// Omitting the field is equivalent on older models and accepted by 5.5, so drop
-// it. Matches only the unescaped structural form, never text inside messages.
-const DISABLED_THINKING_RE = /,\s*"thinking"\s*:\s*\{\s*"type"\s*:\s*"disabled"\s*\}|"thinking"\s*:\s*\{\s*"type"\s*:\s*"disabled"\s*\}\s*,?/g;
-function stripDisabledThinking(str) {
-  return str.replace(DISABLED_THINKING_RE, '');
-}
-
 function stripEffortFromObject(str, objectKey) {
   const keyIdx = str.indexOf('"' + objectKey + '"');
   if (keyIdx === -1) return str;
@@ -1899,6 +1923,9 @@ function processBody(bodyStr, config, requestUrl) {
   // and 404'd every reasoning request. Doing it here, unconditionally, fixes it.
   bodyStr = bodyStr.replace(/("model"\s*:\s*")hermes-/g, '$1claude-');
 
+  // Before thinking-block masking, which would make the JSON.parse inside fail.
+  bodyStr = adaptDisabledThinking(bodyStr);
+
   // Repair orphaned tool_use/tool_result pairs before anything else (needs valid
   // JSON; no-op + untouched body when nothing is orphaned).
   if (config.repairOrphanedTools !== false) bodyStr = repairOrphanedToolPairs(bodyStr);
@@ -1930,8 +1957,6 @@ function processBody(bodyStr, config, requestUrl) {
       console.log('[EFFORT] Stripped effort param for Haiku model: ' + modelMatch[1]);
     }
   }
-
-  m = stripDisabledThinking(m);
 
   // Debug: dump raw system prompt (gated — opt in with DEBUG_DUMPS=1)
   if (process.env.DEBUG_DUMPS) {
@@ -3295,7 +3320,8 @@ if (require.main === module) {
 
 module.exports = {
   loadConfig,
-  stripDisabledThinking,
+  adaptDisabledThinking,
+  isAdaptiveOnlyModel,
   envOAuthToken,
   compileReplacer,
   isStructuralContext,
