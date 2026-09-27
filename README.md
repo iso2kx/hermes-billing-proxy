@@ -174,7 +174,7 @@ Create a `config.json` next to `proxy.js` (all keys optional — see `config.exa
 | Var | Effect |
 |-----|--------|
 | `PROXY_PORT` / `PROXY_HOST` | Override port / bind address (default `127.0.0.1`) |
-| `OAUTH_TOKEN` | Supply the token directly (Docker/headless) instead of reading the creds file |
+| `OAUTH_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN` | Supply the token directly (Docker/headless, or the 1-year `claude setup-token` token) instead of reading the creds file |
 | `CC_VERSION` | Pin the emulated Claude Code version instead of auto-detecting from `claude --version` |
 | `CCH_SEED` | Override the xxHash64 seed for `cch` (accepts `0x`-hex or decimal) if a CC update ever changes it |
 | `REQUIRED_BETAS` | Comma-separated override for the `anthropic-beta` set (otherwise auto-extracted from the CC binary, cached in `.betas_cache.json`) |

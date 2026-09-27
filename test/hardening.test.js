@@ -226,7 +226,7 @@ test('allowlist covers native rename targets and injected stubs', () => {
   assert.ok(allow.has('Bash'), 'rename target missing');
   assert.ok(allow.has('Read'), 'rename target missing');
   assert.ok(allow.has('Grep'), 'injected CC stub missing');
-  assert.ok(allow.has('TodoRead'), 'injected CC stub missing');
+  assert.ok(allow.has('NotebookEdit'), 'injected CC stub missing');
   assert.ok(!allow.has('mcp__ripgrep__search'), 'mcp__ targets are matched by prefix, not the allowlist');
 });
 

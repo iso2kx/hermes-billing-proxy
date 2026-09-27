@@ -400,6 +400,15 @@ function getModelBetas(modelId) {
 // 400s when sent `effort`, but Opus/Sonnet use it, so callers gate this on the
 // model. Raw-string (no JSON.parse) to preserve the proxy-wide byte-fidelity
 // principle. No-op when the object or the field is absent.
+// Hermes' auxiliary calls (title generation etc.) send thinking:{type:"disabled"},
+// which claude-opus-5-5 rejects with a 400 ("use thinking.type.adaptive").
+// Omitting the field is equivalent on older models and accepted by 5.5, so drop
+// it. Matches only the unescaped structural form, never text inside messages.
+const DISABLED_THINKING_RE = /,\s*"thinking"\s*:\s*\{\s*"type"\s*:\s*"disabled"\s*\}|"thinking"\s*:\s*\{\s*"type"\s*:\s*"disabled"\s*\}\s*,?/g;
+function stripDisabledThinking(str) {
+  return str.replace(DISABLED_THINKING_RE, '');
+}
+
 function stripEffortFromObject(str, objectKey) {
   const keyIdx = str.indexOf('"' + objectKey + '"');
   if (keyIdx === -1) return str;
@@ -427,11 +436,13 @@ function stripEffortFromObject(str, objectKey) {
 //   • The survivors that have a compatible Hermes tool are reverse-mapped onto
 //     it via CC_STUB_REVERSALS below, so calling one does the obvious thing
 //     instead of failing.
+// Sep 2026: TodoRead was dropped (Claude Code 2.1.283 has no such tool), and a
+// stub is skipped whenever a real Hermes tool already maps onto its name
+// (search_files -> Grep), since two tools with one name is a hard 400.
 const CC_TOOL_STUBS = [
   '{"name":"Glob","description":"Find files by pattern","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern"}},"required":["pattern"]}}',
   '{"name":"Grep","description":"Search file contents","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern"},"path":{"type":"string","description":"Search path"}},"required":["pattern"]}}',
-  '{"name":"NotebookEdit","description":"Edit notebook cells","input_schema":{"type":"object","properties":{"notebook_path":{"type":"string"},"cell_index":{"type":"integer"}},"required":["notebook_path"]}}',
-  '{"name":"TodoRead","description":"Read current task list","input_schema":{"type":"object","properties":{}}}'
+  '{"name":"NotebookEdit","description":"Edit notebook cells","input_schema":{"type":"object","properties":{"notebook_path":{"type":"string"},"cell_index":{"type":"integer"}},"required":["notebook_path"]}}'
 ];
 
 // Reverse-ONLY aliases: stub name -> the Hermes tool that actually serves it.
@@ -446,11 +457,45 @@ const CC_TOOL_STUBS = [
 //                                 instead of a dead end.
 // NotebookEdit has no Hermes equivalent and is left unmapped (never observed
 // being called).
+// Stubs whose name the (already renamed) tools section does not carry yet.
+function stubsToInject(toolsSection) {
+  return CC_TOOL_STUBS.filter(stub => {
+    const name = JSON.parse(stub).name;
+    return !toolsSection.includes(`"name":"${name}"`);
+  });
+}
+
 const CC_STUB_REVERSALS = [
-  ['TodoRead', 'todo'],
   ['Grep', 'search_files'],
   ['Glob', 'search_files'],
 ];
+
+// Hermes's OAuth wire aliases (agent/anthropic_adapter.py
+// _OAUTH_TOOL_NAME_ALIASES): with a Claude Code token Hermes sends these tools
+// under a different name. Forward-only; the reverse returns the registered name.
+const HERMES_OAUTH_TOOL_ALIASES = [
+  ['session_search', 'chat_history_lookup'],
+  ['memory', 'context_notes'],
+];
+
+// Forward pairs for the name Hermes actually puts on the wire. With a Claude
+// Code OAuth token Hermes renames every tool to `mcp__<name>` itself
+// (_normalize_to_mcp_wire: `read_file` -> `mcp__read_file`,
+// `mcp_x_y` -> `mcp__x_y`), so the bare-name entries alone never fire. The
+// reverse stays bare: Hermes dispatches a registered name as-is and only
+// un-prefixes names that carry `mcp__`, so bare works with and without OAuth.
+function hermesWirePairs(toolRenames) {
+  const out = [];
+  const target = new Map(toolRenames);
+  for (const [orig, cc] of toolRenames) {
+    const wire = orig.startsWith('mcp__') ? orig : 'mcp__' + orig.replace(/^mcp_/, '');
+    if (wire !== orig) out.push([wire, cc]);
+  }
+  for (const [orig, alias] of HERMES_OAUTH_TOOL_ALIASES) {
+    if (target.has(orig)) out.push(['mcp__' + alias, target.get(orig)]);
+  }
+  return out;
+}
 
 // ─── Billing Fingerprint ────────────────────────────────────────────────────
 // Computes a 3-character SHA256 fingerprint hash matching real CC's
@@ -557,11 +602,13 @@ function relocateSystemToUser(bodyStr, config) {
   if (!Array.isArray(obj.system) || !Array.isArray(obj.messages)) return bodyStr;
   const kept = [];    // billing + identity stay in system
   const moved = [];   // everything else → first user message
+  let movedCacheControl = null; // last cache breakpoint among the moved blocks
   let identitySeen = false;
   for (const block of obj.system) {
     if (!block || typeof block.text !== 'string') { kept.push(block); continue; }
     const text = block.text;
     if (text.startsWith(BILLING_TEXT_PREFIX)) { kept.push(block); continue; }
+    if (block.cache_control) movedCacheControl = block.cache_control;
     if (text.startsWith(CC_IDENTITY)) {
       if (!identitySeen) { identitySeen = true; kept.push({ type: 'text', text: CC_IDENTITY }); }
       const rest = text.slice(CC_IDENTITY.length).replace(/^\n+/, '');
@@ -578,12 +625,21 @@ function relocateSystemToUser(bodyStr, config) {
   if (moved.length === 0) return bodyStr; // nothing to relocate — leave untouched
   obj.system = kept;
   const reminder = moved.map(t => `<system-reminder>\n${t}\n</system-reminder>`).join('\n\n');
+  // The reminder is its own block carrying the system prompt's cache breakpoint.
+  // Merged into the user's text, the only breakpoint sat AFTER the user's words,
+  // so no two conversations shared a cached prefix: every new session, cron run
+  // and subagent re-wrote ~50k tokens of tools + system to the cache (measured
+  // 2026-09-28: cache_read 0 / cache_write 50,159 on back-to-back sessions).
+  // Moving ≥1 system breakpoint and adding this one never raises the count.
+  const reminderBlock = movedCacheControl
+    ? { type: 'text', text: reminder, cache_control: movedCacheControl }
+    : { type: 'text', text: reminder };
   const um = obj.messages.find(m => m && m.role === 'user');
   if (!um) return bodyStr; // no user message to carry the reminder — abort relocation
   if (Array.isArray(um.content)) {
     const tb = um.content.find(c => c && c.type === 'text');
     if (tb) {
-      tb.text = reminder + '\n\n' + tb.text;
+      um.content.splice(um.content.indexOf(tb), 0, reminderBlock);
     } else if (um.content.some(c => c && c.type === 'tool_result')) {
       // This first user turn is a tool_result response to a prior tool_use
       // (happens when a compacted/long history begins mid tool-exchange).
@@ -595,12 +651,12 @@ function relocateSystemToUser(bodyStr, config) {
       for (let k = 0; k < um.content.length; k++) {
         if (um.content[k] && um.content[k].type === 'tool_result') idx = k + 1;
       }
-      um.content.splice(idx, 0, { type: 'text', text: reminder });
+      um.content.splice(idx, 0, reminderBlock);
     } else {
-      um.content.unshift({ type: 'text', text: reminder });
+      um.content.unshift(reminderBlock);
     }
   } else if (typeof um.content === 'string') {
-    um.content = reminder + '\n\n' + um.content;
+    um.content = [reminderBlock, { type: 'text', text: um.content }];
   } else {
     return bodyStr;
   }
@@ -781,13 +837,28 @@ const DEFAULT_REPLACEMENTS = [
 // (Glob/Grep/Agent/NotebookEdit/TodoRead) to prevent duplicate-name 400s.
 const DEFAULT_TOOL_RENAMES = [
   // ── Core tools -> genuine native Claude Code tools ──
+  // Targets are checked against a captured Claude Code 2.1.283 request
+  // (Sep 2026): Task became Agent, and TodoWrite/BashOutput/KillShell no longer
+  // exist, so nothing may map onto those.
   ['terminal', 'Bash'],
-  ['process', 'BashOutput'],
   ['read_file', 'Read'],
   ['write_file', 'Write'],
   ['patch', 'Edit'],
-  ['delegate_task', 'Task'],
-  ['todo', 'TodoWrite'],
+  ['search_files', 'Grep'],
+  ['delegate_task', 'Agent'],
+  ['web_search', 'WebSearch'],
+  ['web_extract', 'WebFetch'],
+  ['clarify', 'AskUserQuestion'],
+  ['skill_view', 'Skill'],
+  ['process_manage', 'Monitor'],
+  ['cronjob_manage', 'CronCreate'],
+  ['send_message', 'SendMessage'],
+  // Pre-Sep-2026 Hermes spellings of renamed tools, kept so an older session's
+  // replayed history still round-trips. Retargeted off dead CC names.
+  ['process', 'mcp__process__manage'],
+  ['todo', 'mcp__todo__write'],
+  ['cronjob', 'mcp__scheduler__cron'],
+  ['todo_list', 'mcp__todo__list'],
   // Hermes's tool-search bridge (tools/tool_search.py). When ANY deferrable
   // (MCP/plugin) tool exists, Hermes replaces those tools in the visible array
   // with three bridge tools — tool_search/tool_describe/tool_call — and moves
@@ -806,20 +877,26 @@ const DEFAULT_TOOL_RENAMES = [
   ['tool_describe', 'mcp__toolbridge__describe'],
   ['tool_call', 'mcp__toolbridge__call'],
   ['execute_code', 'mcp__pyexec__run'],
-  ['search_files', 'mcp__ripgrep__search'],
   ['memory', 'mcp__memory__store'],
   ['holographic_memory', 'mcp__memory__holographic'],
   ['session_search', 'mcp__memory__search'],
-  ['clarify', 'mcp__elicitation__ask'],
-  ['send_message', 'mcp__messaging__send'],
   ['vision_analyze', 'mcp__vision__analyze'],
+  ['video_analyze', 'mcp__vision__analyze_video'],
   ['image_generate', 'mcp__vision__generate'],
+  ['video_generate', 'mcp__vision__generate_video'],
   ['text_to_speech', 'mcp__audio__speak'],
   ['skill_manage', 'mcp__skills__manage'],
-  ['skill_view', 'mcp__skills__view'],
   ['skills_list', 'mcp__skills__list'],
-  ['cronjob', 'mcp__scheduler__cron'],
   ['mixture_of_agents', 'mcp__agents__mixture'],
+  ['computer_use', 'mcp__computer__use'],
+  ['react_to_message', 'mcp__messaging__react'],
+  ['discord', 'mcp__discord__send'],
+  ['discord_admin', 'mcp__discord__admin'],
+  ['x_search', 'mcp__x__search'],
+  ['xai_video_edit', 'mcp__xai__video_edit'],
+  ['xai_video_extend', 'mcp__xai__video_extend'],
+  ['manage_catalog', 'mcp__catalog__manage'],
+  ['manage_connections', 'mcp__connections__manage'],
   // browser_* -> real Playwright-MCP tool names where they exist
   ['browser_navigate', 'mcp__playwright__browser_navigate'],
   ['browser_back', 'mcp__playwright__browser_navigate_back'],
@@ -832,6 +909,54 @@ const DEFAULT_TOOL_RENAMES = [
   ['browser_type', 'mcp__playwright__browser_type'],
   ['browser_vision', 'mcp__playwright__browser_take_screenshot_full'],
   ['browser_close', 'mcp__playwright__browser_close'],
+  ['browser_exec', 'mcp__playwright__browser_run_code'],
+  ['browser_dialog', 'mcp__playwright__browser_handle_dialog'],
+  ['browser_cdp', 'mcp__playwright__browser_cdp'],
+  ['browser_vault_enter_code', 'mcp__vault__enter_code'],
+  ['browser_vault_fill', 'mcp__vault__fill'],
+  ['browser_vault_list', 'mcp__vault__list'],
+  ['browser_vault_save_login', 'mcp__vault__save_login'],
+  ['browser_vault_unlock', 'mcp__vault__unlock'],
+  // Kanban board tools
+  ['kanban_attach', 'mcp__kanban__attach'],
+  ['kanban_attach_url', 'mcp__kanban__attach_url'],
+  ['kanban_attachments', 'mcp__kanban__attachments'],
+  ['kanban_block', 'mcp__kanban__block'],
+  ['kanban_comment', 'mcp__kanban__comment'],
+  ['kanban_complete', 'mcp__kanban__complete'],
+  ['kanban_create', 'mcp__kanban__create'],
+  ['kanban_heartbeat', 'mcp__kanban__heartbeat'],
+  ['kanban_link', 'mcp__kanban__link'],
+  ['kanban_list', 'mcp__kanban__list'],
+  ['kanban_request_changes', 'mcp__kanban__request_changes'],
+  ['kanban_request_review', 'mcp__kanban__request_review'],
+  ['kanban_show', 'mcp__kanban__show'],
+  ['kanban_unblock', 'mcp__kanban__unblock'],
+  // Agent-to-agent
+  ['a2a_call', 'mcp__a2a__call'],
+  ['a2a_discover', 'mcp__a2a__discover'],
+  ['a2a_history', 'mcp__a2a__history'],
+  ['a2a_list', 'mcp__a2a__list'],
+  ['a2a_orchestrate', 'mcp__a2a__orchestrate'],
+  // Spotify
+  ['spotify_albums', 'mcp__spotify__albums'],
+  ['spotify_devices', 'mcp__spotify__devices'],
+  ['spotify_library', 'mcp__spotify__library'],
+  ['spotify_playback', 'mcp__spotify__playback'],
+  ['spotify_playlists', 'mcp__spotify__playlists'],
+  ['spotify_queue', 'mcp__spotify__queue'],
+  ['spotify_search', 'mcp__spotify__search'],
+  // Feishu / Yuanbao platform tools
+  ['feishu_doc_read', 'mcp__feishu__doc_read'],
+  ['feishu_drive_add_comment', 'mcp__feishu__drive_add_comment'],
+  ['feishu_drive_list_comment_replies', 'mcp__feishu__drive_list_comment_replies'],
+  ['feishu_drive_list_comments', 'mcp__feishu__drive_list_comments'],
+  ['feishu_drive_reply_comment', 'mcp__feishu__drive_reply_comment'],
+  ['yb_query_group_info', 'mcp__yuanbao__query_group_info'],
+  ['yb_query_group_members', 'mcp__yuanbao__query_group_members'],
+  ['yb_search_sticker', 'mcp__yuanbao__search_sticker'],
+  ['yb_send_dm', 'mcp__yuanbao__send_dm'],
+  ['yb_send_sticker', 'mcp__yuanbao__send_sticker'],
   // ParallelSearch MCP — Hermes sends these as single-underscore mcp_* names,
   // which read as foreign (genuine MCP tools use double-underscore mcp__server__tool).
   ['mcp_parallel_search_get_prompt', 'mcp__parallel__get_prompt'],
@@ -858,6 +983,14 @@ const DEFAULT_TOOL_RENAMES = [
   ['project_create', 'mcp__project__create'],
   ['project_list', 'mcp__project__list'],
   ['project_switch', 'mcp__project__switch'],
+  ['desktop_project', 'mcp__project__manage'],
+  ['desktop_preview', 'mcp__workspace__preview'],
+  ['annotate_preview', 'mcp__workspace__annotate_preview'],
+  ['apply_layout', 'mcp__workspace__apply_layout'],
+  ['drive_preview', 'mcp__workspace__drive_preview'],
+  ['gui_tour', 'mcp__workspace__tour'],
+  ['show_tip', 'mcp__workspace__show_tip'],
+  ['read_window_below', 'mcp__workspace__read_window_below'],
   // Home Assistant toolset (if enabled)
   ['ha_list_entities', 'mcp__homeassistant__list_entities'],
   ['ha_get_state', 'mcp__homeassistant__get_state'],
@@ -972,11 +1105,12 @@ function loadConfig() {
 
   const homeDir = os.homedir();
 
-  // OAUTH_TOKEN env var takes precedence over all file-based credentials (useful for Docker)
+  // A token env var takes precedence over all file-based credentials (useful for
+  // Docker, and for the 1-year `claude setup-token` token, which never refreshes).
   let credsPath = null;
-  if (process.env.OAUTH_TOKEN) {
+  if (envOAuthToken()) {
     credsPath = 'env';
-    console.log('[PROXY] Using OAUTH_TOKEN from environment variable.');
+    console.log('[PROXY] Using OAuth token from environment variable.');
   }
 
   const credsPaths = [
@@ -1097,11 +1231,17 @@ function loadConfig() {
 const CREDS_STAT_INTERVAL_MS = 2000;
 let credsCache = null; // { path, mtimeMs, size, oauth, checkedAt }
 
+// OAUTH_TOKEN is the proxy's own name; CLAUDE_CODE_OAUTH_TOKEN is the one
+// `claude setup-token` tells you to export, so accept either.
+function envOAuthToken() {
+  return (process.env.OAUTH_TOKEN || process.env.CLAUDE_CODE_OAUTH_TOKEN || '').trim();
+}
+
 function getToken(credsPath) {
   // Env var mode: return synthetic OAuth object without file I/O
   if (credsPath === 'env') {
-    const token = process.env.OAUTH_TOKEN;
-    if (!token) throw new Error('OAUTH_TOKEN env var is empty.');
+    const token = envOAuthToken();
+    if (!token) throw new Error('OAUTH_TOKEN / CLAUDE_CODE_OAUTH_TOKEN env var is empty.');
     return { accessToken: token, expiresAt: Infinity, subscriptionType: 'env-var' };
   }
   const now = Date.now();
@@ -1466,7 +1606,7 @@ function ensureReplacers(config) {
   ];
   const replacers = {
     fwdReplace: compileReplacer(config.replacements || []),
-    fwdTools: compileReplacer(tool.map(quoted)),
+    fwdTools: compileReplacer([...tool, ...hermesWirePairs(tool)].map(quoted)),
     fwdProps: compileReplacer(prop.map(quoted)),
     revTools: compileReplacer([...tool.flatMap(revBoth), ...CC_STUB_REVERSALS.flatMap(revAlias)]),
     // Real Hermes tool names (the LHS of every rename), used by
@@ -1600,13 +1740,19 @@ function disguiseForeignTools(body, config) {
     const name = m[1];
     if (seen.has(name)) continue;
     seen.add(name);
-    if (/^mcp__/.test(name)) continue;  // already canonical
     if (allow.has(name)) continue;      // genuine native Claude Code tool
-    if (!name.includes('_')) continue;  // too generic to blind-replace body-wide
+    // Hermes's OAuth wire form is ONE segment (`mcp__kanban_create`), which real
+    // MCP tools never are. The quoted `"mcp__…"` token is distinctive enough to
+    // replace body-wide even without an underscore; the ledger reverses it to
+    // exactly what Hermes sent, which Hermes then resolves itself.
+    const hermesWire = /^mcp__(?!.*__)(\w+)$/.exec(name);
+    if (!hermesWire && /^mcp__/.test(name)) continue;  // already canonical
+    if (!hermesWire && !name.includes('_')) continue;  // too generic to blind-replace body-wide
     let canon = _foreignAssigned.get(name);
     if (!canon) {
-      const cut = name.indexOf('_');
-      const base = `mcp__${name.slice(0, cut)}__${name.slice(cut + 1)}`;
+      const stem = hermesWire ? hermesWire[1] : name;
+      const cut = stem.indexOf('_');
+      const base = cut === -1 ? `mcp__tools__${stem}` : `mcp__${stem.slice(0, cut)}__${stem.slice(cut + 1)}`;
       // Taken by the mcp_ pass, or by a DIFFERENT foreign tool? Suffix it.
       const taken = (c) => _genericallyDisguised.has(c) ||
         (_foreignDisguised.has(c) && _foreignDisguised.get(c) !== name);
@@ -1679,11 +1825,15 @@ const _warnedForeignTools = new Set();
 // to catch non-`mcp_` additions — the exact class of miss that caused the
 // 2026-07-17 coingecko extra-usage incident, just with different spelling.
 // Match against the real set instead of a shape.
+// Roster from a captured Claude Code 2.1.283 request (Sep 2026).
 const KNOWN_CC_NATIVE_TOOLS = new Set([
-  'Bash', 'BashOutput', 'KillShell', 'KillBash',
-  'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'NotebookRead',
-  'Glob', 'Grep', 'LS', 'Task', 'TodoWrite', 'TodoRead',
-  'WebFetch', 'WebSearch', 'ExitPlanMode', 'SlashCommand', 'AskUserQuestion',
+  'Agent', 'Artifact', 'ArtifactComments', 'ArtifactData', 'AskUserQuestion',
+  'Bash', 'CronCreate', 'CronDelete', 'CronList', 'DesignSync', 'Edit',
+  'EnterPlanMode', 'EnterWorktree', 'ExitPlanMode', 'ExitWorktree', 'Glob',
+  'Grep', 'ListAgents', 'Monitor', 'NotebookEdit', 'PowerShell',
+  'PushNotification', 'Read', 'RemoteTrigger', 'ReportFindings',
+  'ScheduleWakeup', 'SendMessage', 'Skill', 'TaskStop', 'WebFetch',
+  'WebSearch', 'Workflow', 'Write',
   // Claude Code's own deferred-tool-discovery tool — the rename target for
   // Hermes's `tool_search` bridge. nativeToolAllowlist() would admit it anyway
   // (every non-mcp__ rename target is allowed), but this set is meant to be the
@@ -1781,6 +1931,8 @@ function processBody(bodyStr, config, requestUrl) {
     }
   }
 
+  m = stripDisabledThinking(m);
+
   // Debug: dump raw system prompt (gated — opt in with DEBUG_DUMPS=1)
   if (process.env.DEBUG_DUMPS) {
     const fs = require('fs');
@@ -1853,10 +2005,11 @@ function processBody(bodyStr, config, requestUrl) {
         // Inject CC tool stubs. Omit the trailing comma when the tools array is
         // empty ("tools":[]) — otherwise the stubs produce [..stub,] which is
         // invalid JSON and 400s.
-        if (config.injectCCStubs) {
+        const stubs = config.injectCCStubs ? stubsToInject(section) : [];
+        if (stubs.length) {
           const insertAt = '"tools":['.length;
           const sep = section[insertAt] === ']' ? '' : ',';
-          section = section.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + sep + section.slice(insertAt);
+          section = section.slice(0, insertAt) + stubs.join(',') + sep + section.slice(insertAt);
         }
         m = m.slice(0, toolsIdx) + section + m.slice(toolsEndIdx + 1);
       }
@@ -1865,10 +2018,12 @@ function processBody(bodyStr, config, requestUrl) {
     // Inject stubs even without description stripping. Omit the trailing comma
     // for an empty "tools":[] array (otherwise [..stub,] is invalid JSON).
     const toolsIdx = m.indexOf('"tools":[');
-    if (toolsIdx !== -1) {
+    const toolsEnd = toolsIdx === -1 ? -1 : findMatchingBracket(m, toolsIdx + '"tools":'.length);
+    const stubs = toolsEnd === -1 ? [] : stubsToInject(m.slice(toolsIdx, toolsEnd + 1));
+    if (stubs.length) {
       const insertAt = toolsIdx + '"tools":['.length;
       const sep = m[insertAt] === ']' ? '' : ',';
-      m = m.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + sep + m.slice(insertAt);
+      m = m.slice(0, insertAt) + stubs.join(',') + sep + m.slice(insertAt);
     }
   }
 
@@ -2594,6 +2749,8 @@ const MILLION_CTX_MIN_GENERATION = [4, 6];
 const MODEL_CONTEXT_1M = 1000000;
 const MODEL_CONTEXT_DEFAULT = 200000;
 const FALLBACK_MODEL_IDS = [
+  'claude-opus-5-5',
+  'claude-fable-5-1',
   'claude-opus-5',
   'claude-opus-4-8',
   'claude-opus-4-7',
@@ -2938,6 +3095,9 @@ function startServer(config) {
                 console.error(`[${ts}] #${reqNum} Body dumped to ${debugPath}`);
               }
             }
+            // Log what upstream actually said — status + headers alone left
+            // every non-extra-usage 400 undiagnosable.
+            console.error(`[${ts}] #${reqNum} body: ${errBody.slice(0, 500)}`);
             // URL-preserving reverse: keeps claude.ai/settings/usage readable.
             errBody = reverseMapErrorBody(errBody, config);
             const nh = { ...upRes.headers };
@@ -3135,6 +3295,8 @@ if (require.main === module) {
 
 module.exports = {
   loadConfig,
+  stripDisabledThinking,
+  envOAuthToken,
   compileReplacer,
   isStructuralContext,
   replaceBareWord,

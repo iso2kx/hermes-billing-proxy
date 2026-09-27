@@ -109,7 +109,22 @@ test('first user turn is a tool_result response: reminder inserted AFTER tool_re
   assert.ok(uc.some((c) => c.type === 'text' && c.text.includes('framework instructions')), 'reminder must be present');
 });
 
-test('first user turn has both tool_result and text: merge into text, tool_result stays first', () => {
+test('reminder is its own block carrying the system cache breakpoint, before the user text', () => {
+  const cc = { type: 'ephemeral', ttl: '1h' };
+  const body = JSON.stringify({
+    system: [{ type: 'text', text: IDENTITY, cache_control: cc }, { type: 'text', text: 'framework', cache_control: cc }],
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'q', cache_control: cc }] }],
+  });
+  const o = JSON.parse(relocateSystemToUser(body, {}));
+  const uc = o.messages[0].content;
+  assert.ok(uc[0].text.includes('framework') && !uc[0].text.includes('q'));
+  assert.deepStrictEqual(uc[0].cache_control, cc);
+  assert.strictEqual(uc[1].text, 'q');
+  const breakpoints = (b) => JSON.stringify(b).split('"cache_control"').length - 1;
+  assert.ok(breakpoints(o) <= breakpoints(JSON.parse(body)), 'relocation must not add cache breakpoints');
+});
+
+test('first user turn has both tool_result and text: tool_result stays first', () => {
   const body = JSON.stringify({
     system: [{ type: 'text', text: IDENTITY }, { type: 'text', text: 'framework' }],
     messages: [
@@ -120,5 +135,6 @@ test('first user turn has both tool_result and text: merge into text, tool_resul
   const o = JSON.parse(relocateSystemToUser(body, {}));
   const uc = o.messages[1].content;
   assert.strictEqual(uc[0].type, 'tool_result', 'tool_result must still lead the user turn');
-  assert.ok(uc.some((c) => c.type === 'text' && c.text.includes('framework') && c.text.includes('q')));
+  assert.ok(uc.some((c) => c.type === 'text' && c.text.includes('framework')));
+  assert.ok(uc.some((c) => c.type === 'text' && c.text === 'q'));
 });
