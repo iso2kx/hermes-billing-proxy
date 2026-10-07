@@ -7,7 +7,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { relocateSystemToUser } = require('../proxy.js');
+const { relocateSystemToUser, processBody } = require('../proxy.js');
 
 const IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 const BILLING = 'x-anthropic-billing-header: cc_version=2.1.203.abc; cc_entrypoint=cli; cch=00000;';
@@ -137,4 +137,24 @@ test('first user turn has both tool_result and text: tool_result stays first', (
   assert.strictEqual(uc[0].type, 'tool_result', 'tool_result must still lead the user turn');
   assert.ok(uc.some((c) => c.type === 'text' && c.text.includes('framework')));
   assert.ok(uc.some((c) => c.type === 'text' && c.text === 'q'));
+});
+
+// claude-*-5-5 answer a request with no CC identity in `system` with a bare
+// 429 rate_limit_error ("Error"). Header-mode billing injects no system block,
+// so a system-less body (cron/script one-shots) used to go out with none.
+test('header mode: system-less /v1/messages body gets the CC identity; OpenAI body does not', () => {
+  const PB = {
+    replacements: [], toolRenames: [], propRenames: [], reverseMap: [],
+    injectCCStubs: false, stripToolDescriptions: false,
+  };
+  const body = JSON.stringify({ model: 'claude-haiku-5-5', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] });
+  const o = JSON.parse(processBody(body, PB, '/v1/messages'));
+  assert.deepStrictEqual(sysTexts(o), [IDENTITY]);
+  assert.strictEqual(userText(o), 'hi', 'user turn must be untouched');
+
+  const empty = JSON.stringify({ system: [], messages: [{ role: 'user', content: 'hi' }] });
+  assert.deepStrictEqual(sysTexts(JSON.parse(relocateSystemToUser(empty, {}))), [IDENTITY]);
+
+  const openai = JSON.stringify({ model: 'gpt-x', messages: [{ role: 'user', content: 'hi' }] });
+  assert.ok(!('system' in JSON.parse(processBody(openai, PB, '/chat/completions'))));
 });

@@ -646,8 +646,12 @@ function relocateSystemToUser(bodyStr, config) {
     const billIdx = kept.findIndex(b => b && typeof b.text === 'string' && b.text.startsWith(BILLING_TEXT_PREFIX));
     kept.splice(billIdx === -1 ? 0 : billIdx + 1, 0, { type: 'text', text: CC_IDENTITY });
   }
-  if (moved.length === 0) return bodyStr; // nothing to relocate — leave untouched
   obj.system = kept;
+  if (moved.length === 0) {
+    // Nothing to relocate. Leave a body that already has the identity untouched,
+    // but never send one without it (empty/absent system).
+    return identitySeen ? bodyStr : JSON.stringify(obj);
+  }
   const reminder = moved.map(t => `<system-reminder>\n${t}\n</system-reminder>`).join('\n\n');
   // The reminder is its own block carrying the system prompt's cache breakpoint.
   // Merged into the user's text, the only breakpoint sat AFTER the user's words,
@@ -2097,6 +2101,13 @@ function processBody(bodyStr, config, requestUrl) {
     m = m.slice(0, sysStart)
       + '"system":[{"type":"text","text":' + originalSysStr + '}]'
       + m.slice(sysEnd);
+  } else if (/^\{\s*"/.test(m) && !m.includes('"system":') &&
+             (/\/messages/.test(requestUrl || '') || looksLikeAnthropicMessages(m))) {
+    // Header mode, no system at all: give relocation an empty array to put the
+    // CC identity in. Legacy mode always injected a system block, so these
+    // bodies used to carry one; header mode sent them with none, which
+    // claude-*-5-5 gate with a bare 429 rate_limit_error (haiku-4-5 doesn't).
+    m = '{"system":[],' + m.slice(1);
   }
 
   // Metadata injection: device_id + session_id matching real CC format
