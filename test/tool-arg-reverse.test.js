@@ -14,6 +14,7 @@ const {
   unmaskToolUseInputs,
   repairOrphanedToolPairs,
   getModelBetas,
+  isLegacyHaiku,
   stripEffortFromObject,
   applySseReverseMapChunks,
 } = require('../proxy.js');
@@ -108,6 +109,19 @@ test('getModelBetas: Opus keeps the full set', () => {
 
 test('getModelBetas: matches hermes-haiku-* too (pre-remap name)', () => {
   assert.ok(!getModelBetas('hermes-haiku-4-5').includes('effort-2025-11-24'));
+});
+
+test('getModelBetas: Haiku 5+ keeps effort / interleaved-thinking (not treated as haiku-4-5)', () => {
+  for (const m of ['claude-haiku-5-5', 'hermes-haiku-5-5', 'claude-haiku-6']) {
+    const betas = getModelBetas(m);
+    assert.ok(betas.includes('effort-2025-11-24'), m);
+    assert.deepStrictEqual(betas, getModelBetas('claude-opus-4-6'), m);
+  }
+});
+
+test('isLegacyHaiku: <=4.x and unversioned legacy names only', () => {
+  for (const m of ['claude-haiku-4-5', 'claude-haiku-4-5-20251001', 'hermes-haiku-4-5', 'claude-3-5-haiku-20241022']) assert.ok(isLegacyHaiku(m), m);
+  for (const m of ['claude-haiku-5-5', 'claude-haiku-5', 'claude-sonnet-5-5', 'claude-opus-4-6', '']) assert.ok(!isLegacyHaiku(m), m);
 });
 
 // ─── stripEffortFromObject ──────────────────────────────────────────────────

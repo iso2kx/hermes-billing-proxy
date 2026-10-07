@@ -383,9 +383,18 @@ function maybeRefreshCcIdentity() {
 // interleaved-thinking and effort, and fast-mode is Opus-only. Real Claude Code
 // only sends a model the betas it accepts — match that so Haiku traffic routed
 // through the proxy doesn't 400. Opus/Sonnet keep the full set unchanged.
+// Haiku 5+ takes effort + adaptive thinking like Opus/Sonnet (real CLI 2.1.285
+// sends haiku-5-5 effort:high); only Haiku <= 4.x and unversioned/legacy
+// names (claude-3-5-haiku-*) still 400 on them.
+function isLegacyHaiku(modelId) {
+  const id = String(modelId || '').toLowerCase();
+  if (!id.includes('haiku')) return false;
+  const m = /haiku-(\d{1,2})(?!\d)/.exec(id); // 1-2 digits: not a 2024xxxx date suffix
+  return !m || parseInt(m[1], 10) < 5;
+}
+
 function getModelBetas(modelId) {
-  const id = (modelId || '').toLowerCase();
-  if (id.includes('haiku')) {
+  if (isLegacyHaiku(modelId)) {
     const drop = new Set([
       'interleaved-thinking-2025-05-14',
       'effort-2025-11-24',
@@ -1950,12 +1959,12 @@ function processBody(bodyStr, config, requestUrl) {
     toolInputMasks = masked.masks;
   }
 
-  // Strip the `effort` param for Haiku (Haiku 400s on it; Opus/Sonnet keep it).
+  // Strip the `effort` param for Haiku <= 4.x (it 400s; Haiku 5+/Opus/Sonnet keep it).
   // Checked against the still-original model name (remap to claude-* happens
   // later), so match 'haiku' anywhere — covers hermes-haiku-* and claude-haiku-*.
   if (config.stripEffortForHaiku !== false) {
     const modelMatch = m.match(/"model"\s*:\s*"([^"]*)"/);
-    if (modelMatch && modelMatch[1].toLowerCase().includes('haiku')) {
+    if (modelMatch && isLegacyHaiku(modelMatch[1])) {
       m = stripEffortFromObject(m, 'output_config');
       m = stripEffortFromObject(m, 'thinking');
       console.log('[EFFORT] Stripped effort param for Haiku model: ' + modelMatch[1]);
@@ -3367,6 +3376,7 @@ module.exports = {
   unmaskToolUseInputs,
   repairOrphanedToolPairs,
   getModelBetas,
+  isLegacyHaiku,
   stripEffortFromObject,
   findMatchingObject,
   detectCcVersion,
