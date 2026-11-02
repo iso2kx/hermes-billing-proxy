@@ -1,4 +1,9 @@
 'use strict';
+// NOTE: processBody no longer applies the Hermes -> Toolkit swap at all (removed
+// 2026-11-02, see word-mapping.test.js). The replaceBareWord unit tests below
+// still cover the helper, which the legacy-prefix scrub and 'word'-scoped
+// reverse entries use.
+//
 // The forward identity pass (Hermes -> Toolkit) used to be a blind split/join
 // over every system block, and it is forward-only — nothing maps 'toolkit' back.
 // So it rewrote real paths and skill names into strings the model then repeated
@@ -20,8 +25,8 @@ const h = 'hermes';
 test('real paths and identifiers survive the disguise pass', () => {
   const cases = [
     '~/hermes-projects.json',
-    'C:\\Users\\Vimal\\hermes-projects.json',
-    'C:/Users/Vimal/AppData/Local/hermes/skills/devops/',
+    'C:\\Users\\user\\hermes-projects.json',
+    'C:/Users/user/AppData/Local/hermes/skills/devops/',
     '$HOME/AppData/Local/hermes',
     'hermes-scheduled-watchers',
     'hermes-gateway-ops',
@@ -109,7 +114,7 @@ test('a system prompt round-trips without inventing a dead path', () => {
   const sys = [
     'You are Hermes, an agent.',
     'Project state lives in ~/hermes-projects.json.',
-    'Skills are under C:/Users/Vimal/AppData/Local/hermes/skills.',
+    'Skills are under C:/Users/user/AppData/Local/hermes/skills.',
     '  - hermes-gateway-ops: diagnose the gateway',
   ].join('\n');
 
@@ -133,15 +138,14 @@ function bodyWithSystem(sys) {
   });
 }
 
-// The sanitize writes into the parsed body, but `mutated` — which gates the
-// re-stringify — used to be set only when STRIP_PATTERNS removed something.
-// Hermes -> Toolkit is one char LONGER, so on a request with nothing to strip
-// the sanitized copy was discarded and the brand leaked through untouched.
-test('identity is disguised even when there is nothing to strip', () => {
+// The bare Hermes -> Toolkit swap was removed 2026-11-02: it was forward-only,
+// so the model leaked the invented name back to users ("Update Toolkit"), and
+// a billing A/B showed it bought nothing. The model must see the real name.
+test('the system prompt is not given an invented brand', () => {
   const filler = 'Follow the user instructions carefully and cite files. '.repeat(45);
   const out = processBody(bodyWithSystem('You are Hermes, an agent.\n' + filler), loadConfig());
-  assert.ok(out.includes('You are Toolkit'), `brand leaked through: ${out.slice(0, 300)}`);
-  assert.ok(!/\bHermes\b/.test(out), 'a bare brand mention survived');
+  assert.ok(out.includes('You are Hermes, an agent.'), `real name lost: ${out.slice(0, 300)}`);
+  assert.ok(!/\btoolkit\b/i.test(out), 'an invented "Toolkit" reached the model');
 });
 
 // The skills trim used to run only inside `if (stripped > 0)`, so a request
@@ -166,15 +170,15 @@ test('unused skills are trimmed even when there is nothing to strip', () => {
   assert.ok(out.includes('hermes-gateway-ops'), 'kept skill was trimmed');
 });
 
-test('processBody disguises the brand without inventing dead identifiers', () => {
+test('processBody keeps real identifiers and invents none', () => {
   const filler = 'Follow the user instructions carefully and cite files. '.repeat(45);
   const sys = 'You are Hermes, an agent.\n' + filler +
     '\nProject state lives in ~/hermes-projects.json.\n' +
-    'Skills are under C:/Users/Vimal/AppData/Local/hermes/skills.\n' +
+    'Skills are under C:/Users/user/AppData/Local/hermes/skills.\n' +
     '<available_skills>\n  devops:\n    - hermes-gateway-ops: diagnose the gateway\n</available_skills>\n';
   const out = processBody(bodyWithSystem(sys), loadConfig());
 
-  assert.ok(out.includes('You are Toolkit'), 'brand not hidden');
+  assert.ok(out.includes('You are Hermes, an agent.'), 'real name lost');
   assert.ok(out.includes('hermes-projects.json'), 'state file path disguised');
   assert.ok(/Local[/\\]+hermes[/\\]+skills/.test(out), 'skills dir disguised');
   assert.ok(out.includes('hermes-gateway-ops'), 'skill name disguised');

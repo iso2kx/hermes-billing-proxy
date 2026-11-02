@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * OpenClaw Subscription Billing Proxy v2.0
+ * Hermes Billing Proxy (forked from the OpenClaw Subscription Billing Proxy v2.0)
  *
- * Routes OpenClaw API requests through Claude Code's subscription billing
+ * Routes Hermes Agent API requests through Claude Code's subscription billing
  * instead of Extra Usage. Defeats Anthropic's multi-layer detection:
  *
  *   Layer 1: Billing header injection (84-char Claude Code identifier)
@@ -813,12 +813,16 @@ const STAINLESS_HEADERS = (() => {
 // IMPORTANT: Use space-free replacements for lowercase 'openclaw' to avoid
 // breaking filesystem paths (e.g., .openclaw/ -> .ocplatform/, not .oc platform/)
 const DEFAULT_REPLACEMENTS = [
-  ['Hermes Agent', 'Claude Code'],
-  ['hermes agent', 'claude code'],
-  ['hermes-agent', 'claude-code'],
-  ['Hermes agent', 'Claude Code'],
-  ['Nous Research', 'Anthropic'],
-  ['nous research', 'anthropic'],
+  // NO Hermes Agent -> Claude Code forward swaps here (removed 2026-11-02):
+  // Hermes already applies exactly this swap itself in OAuth mode
+  // (agent/anthropic_adapter.py _OAUTH_SYSTEM_REPLACEMENTS), so these never
+  // matched anything. The REVERSE entries must stay — see DEFAULT_REVERSE_MAP.
+  // NO Nous Research -> Anthropic swaps (removed 2026-11-02). They were
+  // forward-only, so the model was told Anthropic makes Hermes and repeated it
+  // ("Anthropic's agent framework"), and a lowercase URL like
+  // nousresearch.com/docs reached it as anthropic.com/docs. Billing A/B with
+  // them removed: subscription, no extra usage (see the Toolkit note in
+  // processBody). Also gone: 'NousResearch' -> 'AnthropicAI' and its reverse.
   ['HERMES_HOME', 'CLAUDE_HOME'],
   ['hermes_home', 'claude_home'],
   ['.hermes/', '.claude-ws/'],
@@ -834,7 +838,6 @@ const DEFAULT_REPLACEMENTS = [
   ['hermes_cli', 'claude_cli'],
   ['HERMES_PLATFORM', 'CLAUDE_PLATFORM'],
   ['HERMES_SESSION_PLATFORM', 'CLAUDE_SESSION_PLATFORM'],
-  ['NousResearch', 'AnthropicAI'],
   // Platform/messaging hints (Telegram gateway fingerprint)
   ['You are on a text messaging communication platform, Telegram.', 'You are in an interactive CLI session.'],
   ['text messaging communication platform, Telegram', 'interactive CLI session'],
@@ -843,12 +846,11 @@ const DEFAULT_REPLACEMENTS = [
   ['Telegram (DM with', 'Session with'],
   ['Please do not use markdown as it does not render.', 'Use markdown for formatting.'],
   ['include MEDIA:/absolute/path/to/file in your response', 'use file tools to share files'],
-  // Dehermesification: scrub the doc-domain leak (per issue #19046). Forward-only
-  // and safe. NOTE: broad bare-"hermes"->"claude" scrubbing was tested and does
-  // NOT defeat Anthropic's current detection (it's structural, not brand-string
-  // based) AND breaks tool execution (renames the functional hermes_tools module),
-  // so it is intentionally NOT done here.
-  ['nousresearch', 'anthropic'],   // nousresearch.com -> anthropic.com (forward-only)
+  // NOTE: broad bare-"hermes"->"claude" scrubbing was tested and does NOT defeat
+  // Anthropic's current detection (it's structural, not brand-string based) AND
+  // breaks tool execution (renames the functional hermes_tools module), so it is
+  // intentionally NOT done here. The forward-only nousresearch -> anthropic
+  // domain scrub was removed for the same reason it broke: it rewrote real URLs.
 ];
 
 // ─── Layer 3: Tool Name Renames ─────────────────────────────────────────────
@@ -1061,9 +1063,18 @@ const DEFAULT_PROP_RENAMES = [
 
 // ─── Reverse Mappings ───────────────────────────────────────────────────────
 const DEFAULT_REVERSE_MAP = [
+  // REQUIRED even though the proxy's own forward twins are gone: Hermes itself
+  // applies this swap before the request leaves it, whenever it treats the
+  // route as Claude-Code OAuth (agent/anthropic_adapter.py
+  // _OAUTH_SYSTEM_REPLACEMENTS + _OAUTH_SLUG_PATTERN). The model therefore
+  // sees the hermes-agent skill as "claude-code" and calls
+  // skill_view("claude-code"); this reversal is what makes that resolve.
+  // Remove only together with disabling Hermes's swap.
   ['Claude Code', 'Hermes Agent'],
   ['claude code', 'hermes agent'],
-  ['claude-code', 'hermes-agent'],
+  // Scoped: only where Hermes's slug swap could have produced it, so
+  // `npm i -g @anthropic-ai/claude-code` etc. survive (see keepHermesSlug).
+  ['claude-code', 'hermes-agent', 'hermesSlug'],
   ['CLAUDE_HOME', 'HERMES_HOME'],
   ['claude_home', 'hermes_home'],
   ['.claude-ws/', '.hermes/'],
@@ -1080,21 +1091,22 @@ const DEFAULT_REVERSE_MAP = [
   ['claude_cli', 'hermes_cli'],
   ['CLAUDE_PLATFORM', 'HERMES_PLATFORM'],
   ['CLAUDE_SESSION_PLATFORM', 'HERMES_SESSION_PLATFORM'],
-  ['AnthropicAI', 'NousResearch'],
-  // Reverse platform hints  
-  ['You are in an interactive CLI session.', 'You are on a text messaging communication platform, Telegram.'],
-  ['interactive CLI session', 'text messaging communication platform, Telegram'],
-  ['You are in an interactive session', 'You are in a Discord server or group chat'],
-  ['Session with', 'Telegram (DM with'],
-  ['Use markdown for formatting.', 'Please do not use markdown as it does not render.'],
-  ['use file tools to share files', 'include MEDIA:/absolute/path/to/file in your response'],
-  // Reverse standalone framework names. Scoped to 'word' so they restore the
-  // agent's identity in prose without rewriting real tokens that merely contain
-  // the brand: claude.ai URLs (Anthropic's own billing error pointed users at a
-  // hermes.ai domain that does not exist), the claude-api skill name, and paths
-  // like /projects/claude-demo.
-  ['Claude', 'Hermes', 'word'],
-  ['claude', 'hermes', 'word'],
+  // The injected CC identity block ("You are Claude Code, Anthropic's official
+  // CLI for Claude.") — when the model parrots it, restore what Hermes actually
+  // is. Whole phrases only (longest-first matching makes the long form win).
+  ["Claude Code, Anthropic's official CLI for Claude", 'Hermes Agent, the open-source agent by Nous Research'],
+  ["Anthropic's official CLI for Claude", 'the open-source agent by Nous Research'],
+  // REMOVED 2026-11-02 — reversals that fired on ordinary model prose:
+  //  * platform hints ('Session with' -> 'Telegram (DM with', 'interactive CLI
+  //    session' -> '...Telegram', 'Use markdown for formatting.' -> 'do not use
+  //    markdown'). Their forward twins only sanitize Hermes's system prompt; the
+  //    model never needs them translated back, and any reply that happened to
+  //    use the phrase was rewritten into nonsense.
+  //  * bare-word 'Claude'/'claude' -> 'Hermes'. It renamed every real Claude
+  //    product the model mentioned ("Claude Desktop" -> "Hermes Desktop") and,
+  //    combined with the identity block, produced "Anthropic's official CLI for
+  //    Hermes". Hermes's own disguised identity round-trips via 'Claude Code'.
+  //  * 'AnthropicAI' -> 'NousResearch' (its forward twin is gone).
 ];
 
 // Reverse-map entries that are UNSAFE to apply inside tool-call arguments.
@@ -1105,13 +1117,19 @@ const DEFAULT_REVERSE_MAP = [
 // reverse pattern's "find"). Everything NOT listed here (paths like .claude-ws/,
 // env vars, filenames, CLI ids, plus prop/tool renames) is structural and still
 // applied to tool args so the proxy's own disguised tokens round-trip.
-// NOTE: 'claude-code'/'Claude Code' are deliberately KEPT (they restore Hermes's
-// own disguised hermes-agent paths); only the bare-word/prose swaps are dropped.
+// NOTE: 'claude-code'/'Claude Code' are deliberately NOT listed: they restore
+// Hermes's own disguised hermes-agent identifiers (skill names, paths) in tool
+// args. Bare 'Claude'/'claude' and the prose phrases stay listed so a
+// config.json re-adding them is still kept out of tool args.
 const TOOL_ARG_UNSAFE_REVERSALS = new Set([
   'Claude Code', 'claude code', 'Claude', 'claude',
   'You are in an interactive CLI session.', 'interactive CLI session',
   'You are in an interactive session', 'Session with',
   'Use markdown for formatting.', 'use file tools to share files',
+  // Identity-phrase restores are prose too. (The removed prose entries above
+  // stay listed so a user config.json that re-adds them is still kept out of
+  // tool args.)
+  "Claude Code, Anthropic's official CLI for Claude", "Anthropic's official CLI for Claude",
 ]);
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -1602,24 +1620,49 @@ function checkDisguiseLeak(text, where) {
 // swap that must NOT fire inside an identifier (see isStructuralContext). Pairs
 // without it keep the old unconditional behaviour, so structural entries such as
 // '.claude-ws/' and 'CLAUDE.md' are unaffected.
+// Scope 'hermesSlug': reverse a token only where Hermes's own OAuth slug swap
+// (agent/anthropic_adapter.py _OAUTH_SLUG_PATTERN, hermes-agent -> claude-code)
+// could have produced it, so genuine third-party uses survive:
+//   @anthropic-ai/claude-code, github.com/anthropics/claude-code,
+//   claude-code-20250219, docs.claude.com/claude-code.json  -> kept
+//   "claude-code" (skill_view arg), - claude-code: (skill index),
+//   ...\hermes\claude-code\venv, .../hermes/claude-code/agent -> reversed
+// Mirrors Hermes's rule (rewrite when not glued to [\w./:@-] before or
+// [\w/@-] / ".x" after) with two widenings for how the model REUSES the token:
+// quotes are allowed (tool-arg JSON), and any path under a `hermes` folder is
+// reversed regardless of separators. Outside tool args (streamed prose) the
+// preceding context can be cut off at a chunk boundary; offset 0 then counts as
+// standalone, which errs toward restoring Hermes's name.
+const HERMES_DIR_BEFORE_RE = /hermes[\\/]+$/i;
+function keepHermesSlug(s, start, len) {
+  const before = start > 0 ? s[start - 1] : '';
+  const after = s[start + len] || '';
+  if (HERMES_DIR_BEFORE_RE.test(s.slice(Math.max(0, start - 12), start))) return false;
+  if (before && /[\w./:@-]/.test(before)) return true;
+  if (after && /[\w/@-]/.test(after)) return true;
+  if (after === '.' && /\w/.test(s[start + len + 1] || '')) return true;
+  return false;
+}
+
 function compileReplacer(pairs) {
   if (!pairs || pairs.length === 0) return (s) => s;
   const map = new Map();
-  const wordOnly = new Set();
+  const scoped = new Map(); // find -> keep-predicate(s, offset, len)
   for (const [find, replace, scope] of pairs) {
     if (find && !map.has(find)) {
       map.set(find, replace);
-      if (scope === 'word') wordOnly.add(find);
+      if (scope === 'word') scoped.set(find, isStructuralContext);
+      else if (scope === 'hermesSlug') scoped.set(find, keepHermesSlug);
     }
   }
   if (map.size === 0) return (s) => s;
   const keys = [...map.keys()].sort((a, b) => b.length - a.length);
   const re = new RegExp(keys.map(escapeRegExp).join('|'), 'g');
-  if (wordOnly.size === 0) return (s) => s.replace(re, (hit) => map.get(hit));
-  return (s) => s.replace(re, (hit, offset, whole) =>
-    (wordOnly.has(hit) && isStructuralContext(whole, offset, hit.length))
-      ? hit
-      : map.get(hit));
+  if (scoped.size === 0) return (s) => s.replace(re, (hit) => map.get(hit));
+  return (s) => s.replace(re, (hit, offset, whole) => {
+    const keep = scoped.get(hit);
+    return keep && keep(whole, offset, hit.length) ? hit : map.get(hit);
+  });
 }
 
 // Lazily compile (and cache, non-enumerably) the per-category replacers used by
@@ -2279,29 +2322,23 @@ function processBody(bodyStr, config, requestUrl) {
           const _oc = String.fromCharCode(111,112,101,110,99,108,97,119); // legacy prefix
           text = text.split(_fw + '_tools').join('toolkit_utils');
           text = text.split(_oc + '-imports').join('ext-imports');
-          // Bare-name swap, but ONLY where the name stands alone as a word.
+          // NO bare Hermes -> Toolkit swap (removed 2026-11-02).
           //
-          // This used to be a blind split/join, and it is a FORWARD-ONLY pass —
-          // nothing maps 'toolkit' back. So every identifier it touched became a
-          // string the model would faithfully repeat into a tool call against a
-          // filesystem that had never heard of it: ~/hermes-projects.json read as
-          // ~/toolkit-projects.json, AppData/Local/hermes as AppData/Local/toolkit,
-          // and the hermes-* skills as toolkit-* (skill_view -> "Skill not found").
-          // 85 such calls across 48 sessions, and the agent eventually wrote
-          // "retry the other prefix" workarounds into its own skill library.
-          //
-          // Skipping structural occurrences is the fix rather than adding a
-          // reverse pass: a reverse would have to run over streaming SSE deltas
-          // and could not distinguish a 'toolkit' we invented from one the model
-          // wrote itself — the exact ambiguity that made the old blanket reverse
-          // corrupt "Redux Toolkit" (see the note further down).
-          text = replaceBareWord(text, _FW, 'Toolkit');
-          text = replaceBareWord(text, _fw, 'toolkit');
+          // It was forward-only, so the model was told it ran inside "Toolkit"
+          // while every tool result, commit and issue said "Hermes" — and it
+          // leaked the invented name back to the user ("1. **Update Toolkit:**").
+          // A/B on a captured 116 KB Hermes request (3 replays per arm, same
+          // body): with the swap, 3/3 identity answers said "Toolkit"; without
+          // it, 0/3 — and both arms billed to the subscription (200, no
+          // extra-usage 400). Detection is structural (tool set + cch + system
+          // relocation), not brand-string based. An earlier blind split/join
+          // version also corrupted real paths and skill names (85 dead tool
+          // calls across 48 sessions); dropping the swap removes that class too.
           text = replaceBareWord(text, _oc, 'toolkit');
           stripped += origLen - text.length;
           // `mutated` gates the re-stringify below, and it used to be set only
           // when `stripped > 0`. The name-sanitize above can leave the text the
-          // same length or LONGER (Hermes -> Toolkit is +1), so on a request
+          // same length or LONGER (the old Hermes -> Toolkit swap was +1), so on a request
           // with nothing to strip the sanitized `parsed` was silently thrown
           // away and the identity leaked through untouched. Flag the real edit.
           if (text !== block.text) mutated = true;
@@ -2820,6 +2857,24 @@ function contextLengthFor(id) {
   return has1M ? MODEL_CONTEXT_1M : MODEL_CONTEXT_DEFAULT;
 }
 
+// Local-model server discovery endpoints that Anthropic does not serve. Exact
+// paths only (query string ignored) so nothing real can be swallowed —
+// /v1/models and /v1/models/<id> are NOT here (Anthropic answers those).
+const LOCAL_PROBE_PATHS = {
+  GET: new Set(['/version', '/props', '/v1/props', '/api/tags', '/api/v1/models', '/api/version']),
+  POST: new Set(['/api/show']),
+};
+const LOCAL_PROBE_404_BODY = JSON.stringify({
+  type: 'error', error: { type: 'not_found_error', message: 'Not found' }, request_id: null,
+});
+
+function isLocalModelProbe(method, url) {
+  const paths = LOCAL_PROBE_PATHS[method];
+  if (!paths || typeof url !== 'string') return false;
+  const q = url.indexOf('?');
+  return paths.has(q === -1 ? url : url.slice(0, q));
+}
+
 function buildModelList(ids) {
   return ids.map(id => ({
     id, object: 'model', owned_by: 'anthropic', context_length: contextLengthFor(id),
@@ -2879,6 +2934,7 @@ function startServer(config) {
   // cch/disguise is no longer recognized as genuine Claude Code). This is the
   // proxy's one silent failure mode, so surface it on /health.
   let extraUsageHits = 0, lastExtraUsageAt = null;
+  let localProbe404s = 0;
 
   const server = http.createServer((req, res) => {
     // In-flight accounting for graceful shutdown. 'close' fires on normal
@@ -2903,7 +2959,7 @@ function startServer(config) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           status: expiresIn > 0 ? 'ok' : 'token_expired',
-          proxy: 'openclaw-billing-proxy',
+          proxy: 'hermes-billing-proxy',
           version: VERSION,
           requestsServed: requestCount,
           uptime: Math.floor((Date.now() - startedAt) / 1000) + 's',
@@ -2925,6 +2981,7 @@ function startServer(config) {
           cchMode: config.billingAsHeader !== false ? 'http-header' : 'in-system-block (legacy)',
           ccVersion: CC_VERSION,
           tokenExpiresInHours: isFinite(expiresIn) ? expiresIn.toFixed(1) : 'n/a',
+          localProbe404s,
           subscriptionType: oauth.subscriptionType,
           layers: {
             stringReplacements: config.replacements.length,
@@ -2969,6 +3026,20 @@ function startServer(config) {
           serve(FALLBACK_MODEL_IDS, 'fallback (upstream lookup failed)');
         }
       });
+      return;
+    }
+
+    // Local-model discovery probes (Ollama /api/tags + /api/show, llama.cpp
+    // /props, vLLM/LM Studio /version + /api/v1/models). Hermes fires these on
+    // every session start to learn the context window; Anthropic 404s them all.
+    // Answer the same 404 locally: identical result for Hermes, but no upstream
+    // round trip (~0.3s each, ~1.5s per session start) and no ERROR log spam
+    // (~18k lines). Counted on /health instead of logged.
+    if (isLocalModelProbe(req.method, req.url)) {
+      localProbe404s++;
+      req.resume();
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(LOCAL_PROBE_404_BODY);
       return;
     }
 
@@ -3228,7 +3299,7 @@ function startServer(config) {
       const oauth = getToken(config.credsPath);
       const expiresIn = (oauth.expiresAt - Date.now()) / 3600000;
       const h = isFinite(expiresIn) ? expiresIn.toFixed(1) + 'h' : 'n/a (env var)';
-      console.log(`\n  OpenClaw Billing Proxy v${VERSION}`);
+      console.log(`\n  Hermes Billing Proxy v${VERSION}`);
       console.log(`  ─────────────────────────────`);
       console.log(`  Port:              ${config.port}`);
       console.log(`  Bind address:      ${bindHost}`);
@@ -3245,7 +3316,7 @@ function startServer(config) {
       console.log(`  cch attestation:   ${config.computeRealCch === false ? 'off' : (config.billingAsHeader !== false ? 'HTTP header (prompt-cache safe)' : 'in-system-block (legacy)')}`);
       console.log(`  CC headers:        Stainless SDK + identity`);
       console.log(`  Credentials:       ${config.credsPath}`);
-      console.log(`\n  Ready. Set openclaw.json baseUrl to http://${bindHost}:${config.port}\n`);
+      console.log(`\n  Ready. Hermes model.base_url: http://${bindHost}:${config.port}/anthropic (api_mode: anthropic_messages)\n`);
 
       // A failed xxh64 self-test degrades cch to the 00000 placeholder, which
       // bills every request to extra usage — silently. Say so at full volume.
@@ -3387,4 +3458,7 @@ module.exports = {
   safeCut,
   createSseEventTransformer,
   applySseReverseMapChunks,
+  isLocalModelProbe,
+  DEFAULT_REPLACEMENTS,
+  DEFAULT_REVERSE_MAP,
 };
