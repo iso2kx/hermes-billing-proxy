@@ -152,18 +152,26 @@ const UPSTREAM_AGENT = new https.Agent({
 // this is what keeps the billing header "up to date with the CLI". Falls back
 // to a known-good pin when the CLI isn't on PATH (e.g. env-var/headless mode).
 // Override explicitly with the CC_VERSION env var.
+// Timeout is generous because this runs at logon: on a cold boot the first
+// exec of the ~250MB claude.exe (AV scan, cold disk cache) blew past the old 5s
+// limit on 2026-11-09, the proxy fell back to a stale pin, and Anthropic 400'd
+// every request with `claude_code_version_too_old`. Nothing is in flight at
+// startup, so waiting costs nothing. If it still fails, the startup retry loop
+// below keeps trying in the background.
+let CC_VERSION_IS_FALLBACK = false;
 function detectCcVersion(fallback) {
   if (process.env.CC_VERSION) return process.env.CC_VERSION;
   try {
     const out = require('child_process')
-      .execSync('claude --version', { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] })
+      .execSync('claude --version', { timeout: 30000, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
       .toString();
     const m = out.match(/(\d+\.\d+\.\d+)/);
     if (m) return m[1];
   } catch (e) { /* CLI unavailable — use the pinned fallback */ }
+  CC_VERSION_IS_FALLBACK = true;
   return fallback;
 }
-let CC_VERSION = detectCcVersion('2.1.186');
+let CC_VERSION = detectCcVersion('2.1.319');
 
 // Token refresh defaults
 const DEFAULT_REFRESH_THRESHOLD_MINUTES = 2;
@@ -279,13 +287,17 @@ function detectCcVersionAsync() {
   return new Promise((resolve) => {
     if (process.env.CC_VERSION) return resolve(process.env.CC_VERSION);
     const bin = _findClaudeBinPath() || 'claude';
-    require('child_process').execFile(
-      bin, ['--version'], { timeout: 5000, windowsHide: true },
-      (err, stdout) => {
-        if (err) return resolve(null);
-        const m = String(stdout).match(/(\d+\.\d+\.\d+)/);
-        resolve(m ? m[1] : null);
-      });
+    // execFile throws synchronously (spawn EINVAL) for .cmd/.bat shims on
+    // Windows (npm-installed CLI) — treat that as "not detected", never crash.
+    try {
+      require('child_process').execFile(
+        bin, ['--version'], { timeout: 30000, windowsHide: true },
+        (err, stdout) => {
+          if (err) return resolve(null);
+          const m = String(stdout).match(/(\d+\.\d+\.\d+)/);
+          resolve(m ? m[1] : null);
+        });
+    } catch (e) { resolve(null); }
   });
 }
 
@@ -355,6 +367,30 @@ async function refreshCcIdentityAsync(reason) {
   } finally {
     _ccRefreshInFlight = false;
   }
+}
+
+// Startup fallback retry: if the sync probe at module load failed (cold boot,
+// CLI briefly unavailable) we are running on the hardcoded pin, which Anthropic
+// eventually rejects (`claude_code_version_too_old`). Keep probing in the
+// background until the real version is found, instead of waiting for a CLI
+// update or a restart to rescue us.
+if (CC_VERSION_IS_FALLBACK && !process.env.CC_VERSION) {
+  let _fallbackRetries = 0;
+  const _retryStartupDetect = async () => {
+    try {
+      const v = await detectCcVersionAsync();
+      if (v) {
+        CC_VERSION_IS_FALLBACK = false;
+        await refreshCcIdentityAsync('startup detection had fallen back to the pinned version');
+        return;
+      }
+    } catch (e) { /* keep retrying */ }
+    if (++_fallbackRetries < 60) setTimeout(_retryStartupDetect, 30000).unref();
+  };
+  setTimeout(() => {
+    console.error(`[PROXY] ⚠️  Claude Code version detection failed at startup — emulating pinned v${CC_VERSION}; retrying in background.`);
+    void _retryStartupDetect();
+  }, 5000).unref();
 }
 
 // Proactive: if the CLI binary's mtime changed since we last looked, CC was
@@ -3210,6 +3246,13 @@ function startServer(config) {
                 try { fs.writeFileSync(debugPath, bodyStr); } catch(e) {}
                 console.error(`[${ts}] #${reqNum} Body dumped to ${debugPath}`);
               }
+            }
+            // Anthropic rejects an emulated CC version that's too old with an
+            // explicit error code — re-detect the installed CLI (throttled) so
+            // the next request recovers without a manual restart.
+            if (errBody.includes('claude_code_version_too_old') && Date.now() - _ccReactiveRefreshAt > 30000) {
+              _ccReactiveRefreshAt = Date.now();
+              void refreshCcIdentityAsync('claude_code_version_too_old response — re-checking CLI version');
             }
             // Log what upstream actually said — status + headers alone left
             // every non-extra-usage 400 undiagnosable.
