@@ -859,21 +859,15 @@ const DEFAULT_REPLACEMENTS = [
   // nousresearch.com/docs reached it as anthropic.com/docs. Billing A/B with
   // them removed: subscription, no extra usage (see the Toolkit note in
   // processBody). Also gone: 'NousResearch' -> 'AnthropicAI' and its reverse.
-  ['HERMES_HOME', 'CLAUDE_HOME'],
-  ['hermes_home', 'claude_home'],
-  ['.hermes/', '.claude-ws/'],
-  ['.hermes.md', '.claude.md'],
-  ['HERMES.md', 'CLAUDE.md'],
-  ['hermes setup', 'claude setup'],
-  ['hermes model', 'claude model'],
-  ['hermes status', 'claude status'],
-  ['hermes gateway', 'claude gateway'],
-  ['hermes skills', 'claude skills'],
-  ['hermes cron', 'claude cron'],
-  ['HermesCLI', 'ClaudeCLI'],
-  ['hermes_cli', 'claude_cli'],
-  ['HERMES_PLATFORM', 'CLAUDE_PLATFORM'],
-  ['HERMES_SESSION_PLATFORM', 'CLAUDE_SESSION_PLATFORM'],
+  // NO path / env-var / CLI-name swaps (removed 2026-11-25): HERMES_HOME,
+  // .hermes/, HERMES.md, .hermes.md, hermes_cli, HermesCLI, HERMES_*PLATFORM,
+  // `hermes setup|model|status|gateway|skills|cron`. They showed the model a
+  // different text from the disk, and inconsistently (`.hermes/` was swapped,
+  // bare `.hermes` and `hermes plugins` were not), so it saw one folder under
+  // two names and spent much of its reasoning re-deriving the mapping. Their
+  // reverses also collided with real names (CLAUDE.md -> HERMES.md,
+  // `claude setup-token` -> `hermes setup-token`). See the structural-detection
+  // note at the end of this list.
   // Platform/messaging hints (Telegram gateway fingerprint)
   ['You are on a text messaging communication platform, Telegram.', 'You are in an interactive CLI session.'],
   ['text messaging communication platform, Telegram', 'interactive CLI session'],
@@ -1111,22 +1105,18 @@ const DEFAULT_REVERSE_MAP = [
   // Scoped: only where Hermes's slug swap could have produced it, so
   // `npm i -g @anthropic-ai/claude-code` etc. survive (see keepHermesSlug).
   ['claude-code', 'hermes-agent', 'hermesSlug'],
+  // Reverse-only transition entries (2026-11-25). Their forward twins are gone
+  // (see DEFAULT_REPLACEMENTS), but sessions started before then still carry
+  // these tokens in thinking blocks, which are echoed back byte-identical, so the
+  // model can still write them. They are proxy inventions that no real name
+  // uses, so reversing them cannot corrupt anything. Safe to drop once no live
+  // session predates the change. The colliding reverses (CLAUDE.md, .claude.md,
+  // `claude setup|model|status|gateway|skills|cron`, claude_cli, ClaudeCLI,
+  // CLAUDE_*PLATFORM) are gone outright: they rewrote real Claude Code names.
   ['CLAUDE_HOME', 'HERMES_HOME'],
   ['claude_home', 'hermes_home'],
   ['.claude-ws/', '.hermes/'],
   ['.claude-ws', '.hermes'],
-  ['.claude.md', '.hermes.md'],
-  ['CLAUDE.md', 'HERMES.md'],
-  ['claude setup', 'hermes setup'],
-  ['claude model', 'hermes model'],
-  ['claude status', 'hermes status'],
-  ['claude gateway', 'hermes gateway'],
-  ['claude skills', 'hermes skills'],
-  ['claude cron', 'hermes cron'],
-  ['ClaudeCLI', 'HermesCLI'],
-  ['claude_cli', 'hermes_cli'],
-  ['CLAUDE_PLATFORM', 'HERMES_PLATFORM'],
-  ['CLAUDE_SESSION_PLATFORM', 'HERMES_SESSION_PLATFORM'],
   // The injected CC identity block ("You are Claude Code, Anthropic's official
   // CLI for Claude.") — when the model parrots it, restore what Hermes actually
   // is. Whole phrases only (longest-first matching makes the long form win).
